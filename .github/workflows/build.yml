@@ -65,7 +65,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o /opt/baksmali.jar https://github.com/baksmali/baksmali/releases/download/v2.5.2/baksmali-2.5.2.jar
+          curl -fsSL -o /opt/baksmali.jar https://github.com/baksmali/smali/releases/download/v2.5.2/baksmali-2.5.2.jar
           ls -la /opt/baksmali.jar
 
       - name: compile java bridge -> smali
