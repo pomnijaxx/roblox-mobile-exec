@@ -132,7 +132,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o /opt/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          curl -fsSL -o /opt/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar
           printf '#!/bin/sh\nexec java -jar /opt/apktool.jar "$@"\n' > /usr/local/bin/apktool
           chmod +x /usr/local/bin/apktool
           apktool --version
