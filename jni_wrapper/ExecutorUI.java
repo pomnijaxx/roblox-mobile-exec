@@ -153,7 +153,7 @@ public final class ExecutorUI {
             if (sLog == null) return;
             try {
                 sLog.append(line == null ? "null" : line);
-                sLog.append('\n');
+                sLog.append("\n");
                 if (sLog.length() > MAX_LOG_CHARS) {
                     sLog.getEditableText().delete(0, sLog.length() - MAX_LOG_CHARS / 2);
                 }
