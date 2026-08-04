@@ -56,7 +56,8 @@ public final class ExecutorUI {
     /** Persistent notification; tapping it opens the console. */
     public static void ensureNotification(final Context ctx) {
         if (ctx == null) return;
-        UI.post(() -> {
+        UI.post(new Runnable() {
+            public void run() {
             try {
                 Context app = ctx.getApplicationContext();
                 NotificationManager nm =
@@ -91,13 +92,15 @@ public final class ExecutorUI {
             } catch (Throwable t) {
                 Log.w(TAG, "ensureNotification failed", t);
             }
+            }
         });
     }
 
     /** Attach the floating window. Opens the overlay-permission settings if needed. */
     public static void showOverlay(final Context ctx) {
         if (ctx == null) return;
-        UI.post(() -> {
+        UI.post(new Runnable() {
+            public void run() {
             try {
                 if (sOverlay != null) return;
                 Context app = ctx.getApplicationContext();
@@ -130,12 +133,14 @@ public final class ExecutorUI {
             } catch (Throwable t) {
                 Log.w(TAG, "showOverlay failed", t);
             }
+            }
         });
     }
 
     /** Detach the floating window. */
     public static void hideOverlay() {
-        UI.post(() -> {
+        UI.post(new Runnable() {
+            public void run() {
             try {
                 if (sWm != null && sOverlay != null) sWm.removeView(sOverlay);
             } catch (Throwable ignored) {
@@ -144,12 +149,14 @@ public final class ExecutorUI {
             sOverlay = null;
             sScript = null;
             sLog = null;
+            }
         });
     }
 
     /** Append a line to the console log (thread-safe). */
     public static void appendLog(final String line) {
-        UI.post(() -> {
+        UI.post(new Runnable() {
+            public void run() {
             if (sLog == null) return;
             try {
                 sLog.append(line == null ? "null" : line);
@@ -159,6 +166,7 @@ public final class ExecutorUI {
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "appendLog failed", t);
+            }
             }
         });
     }
@@ -225,21 +233,27 @@ public final class ExecutorUI {
         exec.setText("Execute");
         exec.setTextColor(Color.WHITE);
         exec.setBackgroundColor(0xFF1E7E34);
-        exec.setOnClickListener(v -> doExecute());
+        exec.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { doExecute(); }
+        });
 
         Button clear = new Button(app);
         clear.setText("Clear");
         clear.setTextColor(Color.WHITE);
         clear.setBackgroundColor(0xFF3A3A44);
-        clear.setOnClickListener(v -> {
-            if (sScript != null) sScript.setText("");
+        clear.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (sScript != null) sScript.setText("");
+            }
         });
 
         Button close = new Button(app);
         close.setText("Close");
         close.setTextColor(Color.WHITE);
         close.setBackgroundColor(0xFF8C2F2F);
-        close.setOnClickListener(v -> hideOverlay());
+        close.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { hideOverlay(); }
+        });
 
         row.addView(exec, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
@@ -274,9 +288,11 @@ public final class ExecutorUI {
             return;
         }
         appendLog("[exec] executing " + src.length() + " bytes...");
-        new Thread(() -> {
-            int rc = Executor.nativeExec(src);
-            appendLog("[exec] " + (rc == 0 ? "done (0)" : "error code " + rc));
+        new Thread(new Runnable() {
+            public void run() {
+                int rc = Executor.nativeExec(src);
+                appendLog("[exec] " + (rc == 0 ? "done (0)" : "error code " + rc));
+            }
         }, "robloxexec-run").start();
     }
 
