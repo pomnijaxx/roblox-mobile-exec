@@ -107,11 +107,13 @@ public final class ScriptLoader {
         if (ctx == null) return;
         final String text = (title == null ? "" : title)
                 + ((msg == null || msg.isEmpty()) ? "" : "\n" + msg);
-        new Handler(Looper.getMainLooper()).post(() -> {
-            try {
-                Toast.makeText(ctx, text, Toast.LENGTH_LONG).show();
-            } catch (Throwable ignored) {
-                Log.w(TAG, "toast failed", ignored);
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            public void run() {
+                try {
+                    Toast.makeText(ctx, text, Toast.LENGTH_LONG).show();
+                } catch (Throwable ignored) {
+                    Log.w(TAG, "toast failed", ignored);
+                }
             }
         });
     }
