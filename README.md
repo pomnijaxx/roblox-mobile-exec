@@ -53,19 +53,89 @@ The `package-apk` job compiles the native lib, downloads apktool + Android
 build-tools, patches the APK with `apktool/patcher.py` and uploads
 `roblox-patched.apk` as an artifact.
 
+## Running scripts (end-user flow)
+
+Patching the APK injects a complete execution surface. How someone actually
+runs a script depends on whether the **floating console** was attached (CI
+always compiles it now via `scripts/build_java.sh --smali-dir`).
+
+### Option A — persistent notification (recommended)
+1. Install & open the patched Roblox APK once: `adb install -r roblox.apk`
+2. Accept the three prompts the patched app needs (granted per-app in Settings):
+   `SYSTEM_ALERT_WINDOW` (allow from this app), `POST_NOTIFICATIONS`,
+   `FOREGROUND_SERVICE`. Without `SYSTEM_ALERT_WINDOW` the console still
+   shows a toast telling you to open Settings → the app → Permissions →
+   "Display over other apps".
+3. A persistent **RobloxExec / Abrir console** notification appears immediately
+   after the app launches (fired from the hooked `Application.onCreate`).
+4. Tap the notification → a translucent `ExecutorUIActivity` fires
+   `ExecutorUI.showOverlay`, which draws a 72%-height floating console over
+   the game screen.
+5. Paste your Lua (UNC-enabled) into the `EditText`, hit **Execute** → the text
+   is handed to `Executor.nativeExec` and runs on a worker thread in the live
+   `lua_State`. Output / error codes appear in the `Log` field (green text).
+   **Clear** wipes the editor; **Close** dismisses the window and the
+   notification is auto-cleared if you also tap Close (window destroy calls
+   `hideOverlay`).
+
+The console is built with framework APIs only (no AndroidX), so there's no
+extra dependency: `NotificationChannel` (API 26+/FINE for newer Android) and
+`TYPE_APPLICATION_OVERLAY` (API 26+, else `TYPE_PHONE`) are guarded by
+version checks.
+
+### Option B — auto-exec file (no UI interaction at all)
+Drop a Lua script at
+
+```
+/data/user/0/com.roblox.client/files/robloxexec/autoload.lua
+```
+
+On the *next* process start, `ExecutorBridge.start → ScriptLoader.autoExec`
+opens `robloxexec/autoload.lua`, feeds it to `nativeExec`, and prints the code
+(`[autoload] executing ... / [autoload] done (0)`) to the console log if the
+UI is attached (silent otherwise). This is the path Delta users reach with by
+"dropping the file in the folder".
+
+`config.json.example` is a hint for what a richer config might carry (executor
+name, version, default fidelity) — it's metadata only and not hot-loaded today.
+
+### Option C — in-game (the UNC surface is already live)
+Because `luaL_loadstring` is hooked and `_G.load`/`loadstring` are shadowed on
+the resident `lua_State`, *any* script executing inside Roblox can simply do
+```lua
+local t = request({Url="https://...";}) 
+loadstring(t.Body)()   -- sUNC gate is satisfied inside engine frames
+```
+The end-user doesn't start the console there; they just call Lua that calls
+back into a script they already fetched. The console (A) / file (B) are how a
+person *initially* gets their script onto the device.
+
 ## APK injection
 
 ```bash
+# native lib + handwritten bridge (sUNC core only, no UI)
 python3 apktool/patcher.py --apk roblox.apk \
                            --lib build_output/librobloxexec.so \
                            --out roblox_patched.apk
-adb install -r roblox_patched.apk
+
+# plus the floating console: compile the UI classes to smali, then pass them in
+bash scripts/build_java.sh -o smali_out                  # javac + d8 + baksmali
+python3 apktool/patcher.py --apk roblox.apk \
+                           --lib build_output/librobloxexec.so \
+                           --smali-dir smali_out \
+                           --out roblox_with_ui.apk
+adb install -r roblox_with_ui.apk
 ```
 
-The patcher decompiles with apktool, drops `lib/arm64-v8a/librobloxexec.so`,
-writes the `roblox.executor.*` smali bridge, hooks the app `Application`'s
-`onCreate()` (falling back to a proxy Application), rebuilds, zipaligns and
-signs (auto-generated debug keystore if none given).
+The patcher (`apktool/patcher.py`) decompiles with apktool, drops
+`lib/arm64-v8a/librobloxexec.so`, writes `roblox.executor.*` smali bridge
+(or uses your `--smali-dir`), **injects `android.permission.SYSTEM_ALERT_WINDOW`,
+`POST_NOTIFICATIONS`, `FOREGROUND_SERVICE` and a transparent
+`ExecutorUIActivity` into `AndroidManifest.xml`** when the console is present),
+hooks the app `Application.onCreate()` → `ExecutorBridge.start()` (falling
+back to a generated `ProxyApplication`), rebuilds, `zipalign`s and signs
+(auto debug keystore unless `--ks` given). Run on-device; the console needs
+its runtime permission grants from Settings.
 
 ## UNC surface
 

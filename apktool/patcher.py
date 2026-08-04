@@ -337,9 +337,18 @@ BRIDGE_SMALI = """\
     invoke-static {p0}, Lroblox/executor/Executor;->nativeInit(Landroid/content/Context;)I
 
     move-result v0
+__UI_HOOK__
 
     return-void
 .end method
+"""
+
+# Hook lines appended to ExecutorBridge.start() when the console UI classes
+# were provided via --smali-dir.
+UI_HOOK_SMALI = """\
+    invoke-static {p0}, Lroblox/executor/ExecutorUI;->ensureNotification(Landroid/content/Context;)V
+
+    invoke-static {p0}, Lroblox/executor/ScriptLoader;->autoExec(Landroid/content/Context;)V
 """
 
 PROXY_APP_SMALI = """\
@@ -356,6 +365,19 @@ PROXY_APP_SMALI = """\
     return-void
 .end method
 """
+
+# Permissions injected when the console UI is present.
+UI_PERMISSIONS = [
+    "android.permission.SYSTEM_ALERT_WINDOW",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.FOREGROUND_SERVICE",
+]
+
+UI_ACTIVITY = (
+    '<activity android:name="roblox.executor.ExecutorUIActivity"'
+    ' android:exported="false"'
+    ' android:theme="@android:style/Theme.Translucent.NoTitleBar"/>'
+)
 
 # --------------------------------------------------------------------------
 # Tooling helpers
@@ -441,6 +463,56 @@ def write_smali(root, rel, content):
     return path
 
 
+def copy_smali_dir(work_apk, smali_dir):
+    """Copy javac/d8/baksmali output (e.g. roblox/executor/*.smali) into the
+    decompiled APK's smali/ tree. Returns True if any classes were copied."""
+    if not smali_dir or not os.path.isdir(smali_dir):
+        return False
+    n = 0
+    for root, _dirs, files in os.walk(smali_dir):
+        for fn in files:
+            if not fn.endswith(".smali"):
+                continue
+            src = os.path.join(root, fn)
+            rel = os.path.relpath(src, smali_dir)  # roblox/executor/ExecutorUI.smali
+            dst = os.path.join(work_apk, "smali", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+    if n:
+        print("[patcher] copied %d smali classes from %s" % (n, smali_dir))
+    return n > 0
+
+
+def inject_manifest(work_apk, has_ui):
+    """Add overlay/notification permissions + the console activity when the
+    UI classes are present. Roblox already declares most perms; we only add
+    what is missing."""
+    manifest = os.path.join(work_apk, "AndroidManifest.xml")
+    with open(manifest, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    changed = False
+    if has_ui:
+        for perm in UI_PERMISSIONS:
+            needle = '<uses-permission android:name="%s"' % perm
+            if needle not in text:
+                text = text.replace("</manifest>",
+                                    '    %s/>\n</manifest>' % needle)
+                changed = True
+        if UI_ACTIVITY.split('"')[1] not in text:
+            m = re.search(r"<application\b[^>]*>", text)
+            if m:
+                text = text[:m.end()] + "\n        " + UI_ACTIVITY + text[m.end():]
+                changed = True
+
+    if changed:
+        with open(manifest, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("[patcher] AndroidManifest.xml updated (perms/activity)")
+    return changed
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -454,6 +526,8 @@ def main():
     ap.add_argument("--ks", default=None, help="keystore (auto-generates if unset)")
     ap.add_argument("--ks-pass", default="android", help="keystore password")
     ap.add_argument("--ks-alias", default="exec", help="keystore alias")
+    ap.add_argument("--smali-dir", default=None,
+                    help="dir with compiled UI classes (javac+d8+baksmali output)")
     args = ap.parse_args()
 
     if not which("apktool"):
@@ -476,12 +550,22 @@ def main():
     shutil.copy2(args.lib, os.path.join(libdir, "librobloxexec.so"))
     print("[patcher] copied librobloxexec.so -> lib/arm64-v8a/")
 
-    # 3. bridge smali
-    write_smali(work_apk, "smali/roblox/executor/Executor.smali", EXECUTOR_SMALI)
-    write_smali(work_apk, "smali/roblox/executor/ScriptLoader.smali", SCRIPTLOADER_SMALI)
-    write_smali(work_apk, "smali/roblox/executor/ExecutorBridge.smali", BRIDGE_SMALI)
+    # 3. bridge smali — Java-compiled UI classes may already cover
+    #    Executor/ScriptLoader when --smali-dir was supplied; only write
+    #    the handwritten fallback templates where the class is missing.
+    has_ui = copy_smali_dir(work_apk, args.smali_dir)
 
-    # 4. hook Application
+    cls_rel = lambda c: "smali/roblox/executor/%s.smali" % c
+    if not os.path.exists(os.path.join(work_apk, cls_rel("Executor"))):
+        write_smali(work_apk, cls_rel("Executor"), EXECUTOR_SMALI)
+    if not os.path.exists(os.path.join(work_apk, cls_rel("ScriptLoader"))):
+        write_smali(work_apk, cls_rel("ScriptLoader"), SCRIPTLOADER_SMALI)
+    bridge_body = BRIDGE_SMALI.replace("__UI_HOOK__",
+                                      UI_HOOK_SMALI if has_ui else "")
+    write_smali(work_apk, cls_rel("ExecutorBridge"), bridge_body)
+
+    # 4. hook the app's Application.onCreate() -> ExecutorBridge.start()
+    #    (falls back to our ProxyApplication when it has none)
     manifest = os.path.join(work_apk, "AndroidManifest.xml")
     app_cls = find_application_class(manifest)
     if app_cls:
@@ -492,14 +576,21 @@ def main():
             print("[patcher] app class '%s' not patched (not found); using ProxyApplication"
                   % app_cls)
             app_cls = None
+    else:
+        app_cls = None
     if not app_cls:
-        proxy = "smali/roblox/executor/ProxyApplication.smali"
-        write_smali(work_apk, proxy, PROXY_APP_SMALI)
+        proxy = cls_rel("ProxyApplication")
+        if not os.path.exists(os.path.join(work_apk, proxy)):
+            write_smali(work_apk, proxy, PROXY_APP_SMALI)
         r = run(["sed", "-i", 's|<application |<application android:name="roblox.executor.ProxyApplication" |',
                  manifest])
         if r.returncode != 0:
             sys.exit("[patcher] could not set ProxyApplication in manifest")
         print("[patcher] manifest now points at roblox.executor.ProxyApplication")
+
+    # 4b. when UI classes are present, inject permissions + launcher activity
+    #    (idempotent: skipped if the app already declares them).
+    inject_manifest(work_apk, has_ui)
 
     # 5. rebuild
     out_apk = args.out

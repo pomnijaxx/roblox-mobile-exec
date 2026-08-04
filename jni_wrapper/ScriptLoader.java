@@ -6,6 +6,8 @@ import android.util.Log;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -118,6 +120,50 @@ public final class ScriptLoader {
     @SuppressWarnings("unused") // called from native via JNI
     public static void onFrame() {
         // future: script queue drain / heartbeat
+    }
+
+    /** Push a line into the floating console log (no-op if UI not shown). */
+    @SuppressWarnings("unused") // called from native via JNI
+    public static void appendLog(String line) {
+        try {
+            ExecutorUI.appendLog(line);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Auto-exec: runs files/robloxexec/autoload.lua on startup, right after
+     * nativeInit. This is the simplest "drop a file" workflow for users —
+     * no console interaction required.
+     */
+    @SuppressWarnings("unused") // called from the injected bridge
+    public static void autoExec(android.content.Context ctx) {
+        if (ctx == null) return;
+        try {
+            File dir = new File(ctx.getFilesDir(), "robloxexec");
+            File f = new File(dir, "autoload.lua");
+            if (!f.isFile()) return;
+            String src = readAll(new FileInputStream(f));
+            ExecutorUI.appendLog("[autoload] executing " + src.length() + " bytes");
+            int rc = Executor.nativeExec(src);
+            ExecutorUI.appendLog(rc == 0
+                    ? "[autoload] done (0)"
+                    : "[autoload] error code " + rc);
+        } catch (Throwable t) {
+            ExecutorUI.appendLog("[autoload] failed: " + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String readAll(InputStream in) throws Exception {
+        try {
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            byte[] tmp = new byte[8192];
+            int n;
+            while ((n = in.read(tmp)) > 0) buf.write(tmp, 0, n);
+            return buf.toString("UTF-8");
+        } finally {
+            in.close();
+        }
     }
 
     private static String escape(String s) {
