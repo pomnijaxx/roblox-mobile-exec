@@ -3,6 +3,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      apk_pkg:
+        description: 'Roblox packageName'
+        default: 'com.roblox.client'
+        required: false
+      apk_version:
+        description: 'Roblox versionCode (2814 = 2.732.1043)'
+        default: '2814'
+        required: false
 jobs:
   build-native:
     runs-on: ubuntu-latest
@@ -24,3 +33,124 @@ jobs:
           name: librobloxexec-arm64
           path: build/librobloxexec.so
           retention-days: 14
+
+  package-apk:
+    needs: build-native
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: android sdk (android.jar + build-tools)
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+          log-accepted-android-sdk-licenses: false
+
+      - name: install sdk packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms/android-34/android.jar" "$ANDROID_HOME/build-tools/34.0.0/d8" "$ANDROID_HOME/build-tools/34.0.0/apksigner" "$ANDROID_HOME/build-tools/34.0.0/zipalign"
+
+      - name: baksmali
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /opt/baksmali.jar https://github.com/baksmali/baksmali/releases/download/v2.5.2/baksmali-2.5.2.jar
+          ls -la /opt/baksmali.jar
+
+      - name: compile java bridge -> smali
+        shell: bash
+        run: bash scripts/build_java.sh -o smali_out
+
+      - name: fetch native lib artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: librobloxexec-arm64
+          path: .
+
+      - name: apk20 download stock installer
+        id: dl
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="${{ inputs.apk_pkg }}"
+          VCODE="${{ inputs.apk_version }}"
+          echo "package=$PKG version=$VCODE"
+          TOKEN_JSON=$(curl -fsS -X POST "https://www.apk20.com/playstore/api/token" \
+            -H "Content-Type: application/json" \
+            -A "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile" \
+            -d "{\"packageName\":\"$PKG\",\"versionCode\":\"$VCODE\",\"variant\":\"default\",\"format\":\"apk\"}")
+          TOKEN=$(echo "$TOKEN_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+          echo "got token ok"
+          curl -fsSL -A "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile" \
+            -o stock_installer.apk \
+            "https://www.apk20.com/playstore/api/download/redeem/$TOKEN"
+          ls -la stock_installer.apk
+
+      - name: rebuild universal apk (base + arm64 split)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import zipfile
+          z = zipfile.ZipFile('stock_installer.apk')
+          splits = [n for n in z.namelist() if n.startswith('assets/splits/') and n.endswith('.apk')]
+          print('splits:', splits)
+          base = [s for s in splits if s.endswith('com.roblox.client.apk')]
+          cfg  = [s for s in splits if 'config' in s and 'arm64' in s]
+          if not base or not cfg:
+              raise SystemExit('expected base + arm64 config splits, got: ' + repr(splits))
+          out = zipfile.ZipFile('roblox_universal.apk', 'w', zipfile.ZIP_DEFLATED)
+          b = zipfile.ZipFile(z.open(base[0]))
+          for n in b.infolist():
+              out.writestr(n, b.read(n.filename))
+          b.close()
+          c = zipfile.ZipFile(z.open(cfg[0]))
+          for n in c.infolist():
+              if n.filename.startswith('lib/arm64-v8a/'):
+                  out.writestr(n, c.read(n.filename))
+          c.close()
+          out.close(); z.close()
+          import zipfile as zz
+          chk = zz.ZipFile('roblox_universal.apk')
+          assert 'lib/arm64-v8a/libroblox.so' in chk.namelist()
+          print('universal ok, entries', len(chk.namelist()))
+          EOF
+          ls -la roblox_universal.apk
+
+      - name: apktool
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /opt/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
+          printf '#!/bin/sh\nexec java -jar /opt/apktool.jar "$@"\n' > /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: patcher inject + rebuild + sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 apktool/patcher.py \
+            --apk roblox_universal.apk \
+            --lib librobloxexec.so \
+            --smali-dir smali_out \
+            --out roblox_patched.apk
+          ls -la roblox_patched.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roblox-patched-apk
+          path: roblox_patched.apk
+          retention-days: 14
+          if-no-files-found: error
