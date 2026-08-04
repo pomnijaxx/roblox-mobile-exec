@@ -1,0 +1,21 @@
+{
+  "version": "0.830.5",
+  "universe": "delta-mobile-rc7",
+  "scriptcontext": "D13TA-RC7-ARM64",
+  "fidelity": 3,
+  "sandbox_flags": 4294967295,
+  "secure": 1,
+  "target": "libRoblox.so",
+  "alt_targets": ["libRobloxApp.so", "libcustruntime.so"],
+  "min_android": 26,
+  "abi": "arm64-v8a",
+  "http": {
+    "user_agent": "RobloxExec/0.830.5 (Luau; arm64-v8a)",
+    "timeout_ms": 8000,
+    "max_body_bytes": 4194304
+  },
+  "paths": {
+    "scripts_dir": "robloxexec/scripts",
+    "logs_dir": "robloxexec/logs"
+  }
+}

@@ -1,0 +1,19 @@
+# build artifacts
+build_output/
+
+# python
+__pycache__/
+*.pyc
+
+# keystores / signing
+*.keystore
+*.jks
+
+# patched apks
+*_patched.apk
+*.aligned
+*.signed
+
+# misc
+*.o
+*.so
