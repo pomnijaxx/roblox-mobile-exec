@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 #include <pthread.h>
