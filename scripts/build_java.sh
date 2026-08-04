@@ -47,6 +47,7 @@ javac -nowarn -proc:none \
     "$ROOT"/jni_wrapper/*.java
 
 echo "[build_java] d8 -> classes.dex"
+mkdir -p "$WORK/dex"
 "$D8" --release --lib "$ANDROID_JAR" --min-api 21 \
     --output "$WORK/dex" \
     "$WORK"/classes/roblox/executor/*.class
