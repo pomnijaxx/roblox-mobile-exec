@@ -537,9 +537,9 @@ def main():
     print("[patcher] workdir: " + work)
     work_apk = os.path.join(work, "apk")
 
-    # 1. decompile (resources are NOT decoded: keeps framework deps safe and
-    #    sidesteps 'Can't find framework resources for package of id' errors)
-    r = run(["apktool", "d", "-r", "-f", "-o", work_apk, args.apk])
+    # 1. decompile (full decode incl. manifest; needs a recent apktool (3.x)
+    #    that can decode modern compileSdk resource tables)
+    r = run(["apktool", "d", "-f", "-o", work_apk, args.apk])
     if r.returncode != 0:
         sys.exit("[patcher] apktool d failed:\n" + r.stderr[-2000:])
     if not os.path.isdir(work_apk):
