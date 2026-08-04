@@ -1,15 +1,21 @@
 name: build
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       apk_url:
-        description: 'URL do APK stock (vazio = so builda a lib)'
+        description: 'URL do APK stock (vazio = so lib .so)'
         required: false
         default: ''
+
 env:
   BT: "34.0.0"
+
 jobs:
   build-native:
     name: Build librobloxexec.so
@@ -21,45 +27,57 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27b
-      - name: Configure
+      - name: Configure CMake
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
       - name: Build
         run: cmake --build build -j2
-      - name: Exports
+      - name: Verify exports
         run: |
-          nm -D build/librobloxexec.so | grep -q ' T JNI_OnLoad'
-          nm -D build/librobloxexec.so | grep -q ' T Java_roblox_executor_Executor_nativeInit'
+          nm -D build/librobloxexec.so | grep -Eq ' T JNI_OnLoad'
+          nm -D build/librobloxexec.so | grep -Eq ' T Java_roblox_executor_Executor_nativeInit'
       - uses: actions/upload-artifact@v4
         with:
           name: librobloxexec-arm64
           path: build/librobloxexec.so
           retention-days: 14
+
   package-apk:
+    name: Build patched APK
     needs: build-native
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.apk_url != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: { name: librobloxexec-arm64, path: build }
+        with:
+          name: librobloxexec-arm64
+          path: build
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '17' }
+        with:
+          distribution: temurin
+          java-version: '17'
       - uses: android-actions/setup-android@v3
-        with: { api-level: 34, build-tools-version: ${{ env.BT }} }
-      - name: Tools
+        with:
+          api-level: 34
+          build-tools-version: ${{ env.BT }}
+      - name: Install tools
         run: |
-          printf '#!/bin/bash\nexec java -jar /opt/apktool.jar "$@"\n' > /usr/local/bin/apktool
+          printf '#!/bin/bash
+exec java -jar /opt/apktool.jar ""' > /usr/local/bin/apktool
           chmod +x /usr/local/bin/apktool
           curl -fsSL -o /opt/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar
           curl -fsSL -o /opt/baksmali.jar https://github.com/google/smali/releases/download/v2.5.3/baksmali-2.5.3.jar
-          echo "$ANDROID_HOME/build-tools/${{ env.BT }}" >> "$GITHUB_PATH"
-      - name: Java bridge -> smali
+          echo "\/build-tools/${{ env.BT }}" >> ""
+      - name: Compile bridge to smali
         run: bash scripts/build_java.sh -o smali_out
-      - name: Download stock APK
+      - name: Download source APK
         run: curl -fL --retry 3 -o src.apk "${{ github.event.inputs.apk_url }}"
       - name: Patch
         run: python3 apktool/patcher.py --apk src.apk --lib build/librobloxexec.so --smali-dir smali_out --out patched.apk
-      - name: Verify sign
-        run: "$ANDROID_HOME/build-tools/${{ env.BT }}/apksigner" verify patched.apk
+      - name: Verify signed
+        run: "\/build-tools/${{ env.BT }}/apksigner" verify patched.apk
       - uses: actions/upload-artifact@v4
-        with: { name: roblox-patched-apk, path: patched.apk, retention-days: 14 }
+        with:
+          name: roblox-patched-apk
+          path: patched.apk
+          retention-days: 14
