@@ -51,6 +51,9 @@ static rblx_Hook g_hook_loadstring{};
 static rblx_Hook g_hook_pcall{};
 static rblx_ExecEnv g_env{};
 
+extern "C" void *rblx_trampoline_loadstring(void){ return g_hook_loadstring.active ? g_hook_loadstring.trampoline : nullptr; }
+extern "C" void *rblx_trampoline_pcall(void){ return g_hook_pcall.active ? g_hook_pcall.trampoline : nullptr; }
+
 /* thread-local call depth: protects the sUNC detour path from re-entry */
 static __thread int g_unc_depth;
 
