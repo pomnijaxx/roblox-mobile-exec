@@ -92,21 +92,34 @@ jobs:
           echo "package=$PKG slug=$SLUG"
           pip install -q curl_cffi
           python3 - "$PKG" "$SLUG" <<'EOF'
-          import re, sys
+          import re, sys, os
           from curl_cffi import requests
           pkg, slug = sys.argv[1], sys.argv[2]
-          page = requests.get(
-              "https://apkcombo.com/%s/%s/download/apk" % (slug, pkg),
-              impersonate="chrome", timeout=60)
-          page.raise_for_status()
-          hrefs = re.findall(r'href="(/r2\?u=[^"]+)"', page.text)
-          if not hrefs:
-              raise SystemExit("no r2 download link found on apkcombo page")
-          dl = requests.get("https://apkcombo.com" + hrefs[0],
-                            impersonate="chrome", timeout=1800, allow_redirects=True)
-          dl.raise_for_status()
-          open("stock_universal.apk", "wb").write(dl.content)
-          print("downloaded stock_universal.apk", len(dl.content), "bytes")
+          got = False
+          try:
+              page = requests.get(
+                  "https://apkcombo.com/%s/%s/download/apk" % (slug, pkg),
+                  impersonate="chrome", timeout=60)
+              if page.status_code == 200:
+                  hrefs = re.findall(r'href="(/r2\?u=[^"]+)"', page.text)
+                  if hrefs:
+                      dl = requests.get("https://apkcombo.com" + hrefs[0],
+                                        impersonate="chrome", timeout=1800,
+                                        allow_redirects=True)
+                      if dl.status_code == 200 and len(dl.content) > 5000000:
+                          open("stock_universal.apk", "wb").write(dl.content)
+                          got = True
+                          print("apkcombo download ok:", len(dl.content), "bytes")
+          except Exception as e:
+              print("apkcombo failed:", type(e).__name__, str(e)[:120])
+          if not got:
+              print("falling back to release asset")
+              os.system("curl -fsSL -o stock_universal.apk "
+                        "https://github.com/pomnijaxx/roblox-mobile-exec/releases/"
+                        "download/stock-roblox-2.732.1043/stock_roblox_universal.apk")
+          data = open("stock_universal.apk", "rb").read()
+          assert data[:2] == b"PK", "not a valid zip/apk"
+          print("stock_universal.apk", len(data), "bytes")
           EOF
           ls -la stock_universal.apk
 
