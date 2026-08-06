@@ -91,7 +91,7 @@ jobs:
           SLUG="${{ inputs.apk_slug }}"
           echo "package=$PKG slug=$SLUG"
           pip install -q curl_cffi
-          python3 - <<'EOF'
+          python3 - "$PKG" "$SLUG" <<'EOF'
           import re, sys
           from curl_cffi import requests
           pkg, slug = sys.argv[1], sys.argv[2]
@@ -107,7 +107,7 @@ jobs:
           dl.raise_for_status()
           open("stock_universal.apk", "wb").write(dl.content)
           print("downloaded stock_universal.apk", len(dl.content), "bytes")
-          EOF "$PKG" "$SLUG"
+          EOF
           ls -la stock_universal.apk
 
       - name: apktool
