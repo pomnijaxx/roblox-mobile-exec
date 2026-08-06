@@ -8,6 +8,10 @@ on:
         description: 'Roblox packageName'
         default: 'com.roblox.client'
         required: false
+      apk_slug:
+        description: 'apkcombo slug for the app page'
+        default: 'roblox'
+        required: false
       apk_version:
         description: 'Roblox versionCode (2814 = 2.732.1043)'
         default: '2814'
@@ -78,55 +82,33 @@ jobs:
           name: librobloxexec-arm64
           path: .
 
-      - name: apk20 download stock installer
+      - name: apkcombo download stock universal APK
         id: dl
         shell: bash
         run: |
           set -euo pipefail
           PKG="${{ inputs.apk_pkg }}"
-          VCODE="${{ inputs.apk_version }}"
-          echo "package=$PKG version=$VCODE"
-          TOKEN_JSON=$(curl -fsS -X POST "https://www.apk20.com/playstore/api/token" \
-            -H "Content-Type: application/json" \
-            -A "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile" \
-            -d "{\"packageName\":\"$PKG\",\"versionCode\":\"$VCODE\",\"variant\":\"default\",\"format\":\"apk\"}")
-          TOKEN=$(echo "$TOKEN_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
-          echo "got token ok"
-          curl -fsSL -A "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile" \
-            -o stock_installer.apk \
-            "https://www.apk20.com/playstore/api/download/redeem/$TOKEN"
-          ls -la stock_installer.apk
-
-      - name: rebuild universal apk (base + arm64 split)
-        shell: bash
-        run: |
-          set -euo pipefail
+          SLUG="${{ inputs.apk_slug }}"
+          echo "package=$PKG slug=$SLUG"
+          pip install -q curl_cffi
           python3 - <<'EOF'
-          import zipfile
-          z = zipfile.ZipFile('stock_installer.apk')
-          splits = [n for n in z.namelist() if n.startswith('assets/splits/') and n.endswith('.apk')]
-          print('splits:', splits)
-          base = [s for s in splits if s.endswith('com.roblox.client.apk')]
-          cfg  = [s for s in splits if 'config' in s and 'arm64' in s]
-          if not base or not cfg:
-              raise SystemExit('expected base + arm64 config splits, got: ' + repr(splits))
-          out = zipfile.ZipFile('roblox_universal.apk', 'w', zipfile.ZIP_DEFLATED)
-          b = zipfile.ZipFile(z.open(base[0]))
-          for n in b.infolist():
-              out.writestr(n, b.read(n.filename))
-          b.close()
-          c = zipfile.ZipFile(z.open(cfg[0]))
-          for n in c.infolist():
-              if n.filename.startswith('lib/arm64-v8a/'):
-                  out.writestr(n, c.read(n.filename))
-          c.close()
-          out.close(); z.close()
-          import zipfile as zz
-          chk = zz.ZipFile('roblox_universal.apk')
-          assert 'lib/arm64-v8a/libroblox.so' in chk.namelist()
-          print('universal ok, entries', len(chk.namelist()))
-          EOF
-          ls -la roblox_universal.apk
+          import re, sys
+          from curl_cffi import requests
+          pkg, slug = sys.argv[1], sys.argv[2]
+          page = requests.get(
+              "https://apkcombo.com/%s/%s/download/apk" % (slug, pkg),
+              impersonate="chrome", timeout=60)
+          page.raise_for_status()
+          hrefs = re.findall(r'href="(/r2\?u=[^"]+)"', page.text)
+          if not hrefs:
+              raise SystemExit("no r2 download link found on apkcombo page")
+          dl = requests.get("https://apkcombo.com" + hrefs[0],
+                            impersonate="chrome", timeout=1800, allow_redirects=True)
+          dl.raise_for_status()
+          open("stock_universal.apk", "wb").write(dl.content)
+          print("downloaded stock_universal.apk", len(dl.content), "bytes")
+          EOF "$PKG" "$SLUG"
+          ls -la stock_universal.apk
 
       - name: apktool
         shell: bash
@@ -143,7 +125,7 @@ jobs:
           set -euo pipefail
           export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
           python3 apktool/patcher.py \
-            --apk roblox_universal.apk \
+            --apk stock_universal.apk \
             --lib librobloxexec.so \
             --smali-dir smali_out \
             --out roblox_patched.apk
