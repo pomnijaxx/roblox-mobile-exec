@@ -1,0 +1,138 @@
+version: 2.1
+
+jobs:
+  build-native:
+    docker:
+      - image: circleci/android:api-34
+    steps:
+      - checkout
+      - run:
+          name: install ndk + cmake
+          command: |
+            sdkmanager "ndk;27.1.12297006" "cmake;3.22.1" >/dev/null 2>&1 || true
+            ls "$ANDROID_HOME/ndk" "$ANDROID_HOME/cmake"
+      - run:
+          name: configure
+          command: |
+            CMAKE="$ANDROID_HOME/cmake/3.22.1/bin/cmake"
+            NINJA="$ANDROID_HOME/cmake/3.22.1/bin/ninja"
+            "$CMAKE" -S . -B build -G Ninja \
+              -DCMAKE_MAKE_PROGRAM="$NINJA" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/27.1.12297006/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26
+      - run:
+          name: build
+          command: |
+            NINJA="$ANDROID_HOME/cmake/3.22.1/bin/ninja"
+            "$NINJA" -C build -j2
+      - run:
+          name: verify
+          command: nm -D build/librobloxexec.so | grep -E " T JNI_OnLoad"
+      - persist_to_workspace:
+          root: .
+          paths:
+            - build/librobloxexec.so
+
+  package-apk:
+    docker:
+      - image: circleci/android:api-34
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+      - run:
+          name: deps (python, sdk packages)
+          command: |
+            sudo apt-get update >/dev/null 2>&1 || true
+            sudo apt-get install -y python3-pip >/dev/null 2>&1 || true
+            sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null 2>&1 || true
+            ls "$ANDROID_HOME/platforms/android-34/android.jar" "$ANDROID_HOME/build-tools/34.0.0/d8" "$ANDROID_HOME/build-tools/34.0.0/apksigner" "$ANDROID_HOME/build-tools/34.0.0/zipalign"
+      - run:
+          name: baksmali
+          command: |
+            curl -fsSL -o /tmp/baksmali.jar https://github.com/baksmali/smali/releases/download/v2.5.2/baksmali-2.5.2.jar
+            sudo mv /tmp/baksmali.jar /opt/baksmali.jar
+            ls -la /opt/baksmali.jar
+      - run:
+          name: compile java bridge -> smali
+          command: bash scripts/build_java.sh -o smali_out
+      - run:
+          name: apkcombo download stock universal APK
+          command: |
+            set -euo pipefail
+            PKG="com.roblox.client"
+            SLUG="roblox"
+            pip install -q curl_cffi
+            python3 - "$PKG" "$SLUG" <<'EOF'
+            import re, sys, os
+            from curl_cffi import requests
+            pkg, slug = sys.argv[1], sys.argv[2]
+            got = False
+            try:
+                page = requests.get(
+                    "https://apkcombo.com/%s/%s/download/apk" % (slug, pkg),
+                    impersonate="chrome", timeout=60)
+                if page.status_code == 200:
+                    hrefs = re.findall(r'href="(/r2\?u=[^"]+)"', page.text)
+                    if hrefs:
+                        dl = requests.get("https://apkcombo.com" + hrefs[0],
+                                          impersonate="chrome", timeout=1800,
+                                          allow_redirects=True)
+                        if dl.status_code == 200 and len(dl.content) > 5000000:
+                            open("stock_universal.apk", "wb").write(dl.content)
+                            got = True
+                            print("apkcombo download ok:", len(dl.content), "bytes")
+            except Exception as e:
+                print("apkcombo failed:", type(e).__name__, str(e)[:120])
+            if not got:
+                print("falling back to release asset")
+                os.system("curl -fsSL -o stock_universal.apk "
+                          "https://github.com/pomnijaxx/roblox-mobile-exec/releases/"
+                          "download/stock-roblox-2.732.1043/stock_roblox_universal.apk")
+            data = open("stock_universal.apk", "rb").read()
+            assert data[:2] == b"PK", "not a valid zip/apk"
+            print("stock_universal.apk", len(data), "bytes")
+            EOF
+            ls -la stock_universal.apk
+      - run:
+          name: apktool
+          command: |
+            curl -fsSL -o /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar
+            sudo mv /tmp/apktool.jar /opt/apktool.jar
+            printf '#!/bin/sh\nexec java -jar /opt/apktool.jar "$@"\n' | sudo tee /usr/local/bin/apktool >/dev/null
+            sudo chmod +x /usr/local/bin/apktool
+            apktool --version
+      - run:
+          name: patcher inject + rebuild + sign
+          command: |
+            set -euo pipefail
+            export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
+            python3 apktool/patcher.py \
+              --apk stock_universal.apk \
+              --lib librobloxexec.so \
+              --smali-dir smali_out \
+              --out roblox_patched.apk
+            keytool -genkeypair -v -keystore debug.keystore -storepass android \
+              -alias exec -keypass android -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=RobloxExec, OU=Mobile, O=exec, C=US" 2>/dev/null || true
+            "$ANDROID_HOME/build-tools/34.0.0/zipalign" -f 4 roblox_patched.apk roblox_patched_aligned.apk
+            mv roblox_patched_aligned.apk roblox_patched.apk
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks debug.keystore \
+              --ks-pass pass:android --key-pass pass:android \
+              --out roblox_patched_signed.apk roblox_patched.apk
+            mv roblox_patched_signed.apk roblox_patched.apk
+            "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs roblox_patched.apk
+            ls -la roblox_patched.apk
+      - store_artifacts:
+          path: roblox_patched.apk
+          destination: roblox-patched-apk
+
+workflows:
+  version: 2
+  build:
+    jobs:
+      - build-native
+      - package-apk:
+          requires:
+            - build-native
