@@ -18,7 +18,7 @@ on:
         required: false
 jobs:
   build-native:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: ndk
@@ -41,7 +41,7 @@ jobs:
   package-apk:
     needs: build-native
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
