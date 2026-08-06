@@ -437,6 +437,28 @@ def find_application_class(manifest_path):
     return n.group(1) if n else None
 
 
+def strip_split_metadata(manifest_path):
+    """Turn a Play Store split/base APK into a standalone universal one by
+    removing the split-required attributes and vending split meta-data."""
+    with open(manifest_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    orig = text
+    text = re.sub(
+        r'\s+android:(isSplitRequired|requiredSplitTypes|splitTypes)="[^"]*"',
+        "", text)
+    text = re.sub(
+        r'\s*<meta-data android:name="com\.android\.vending\.'
+        r'(splits[^"]*|derived[^"]*)"[^>]*/>',
+        "", text)
+    if text != orig:
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("[patcher] AndroidManifest.xml: stripped split metadata (universal)")
+        return True
+    print("[patcher] AndroidManifest.xml: no split metadata found")
+    return False
+
+
 def smali_class_path(class_name):
     """'com.foo.App' -> smali/com/foo/App.smali (handles leading dot)."""
     name = class_name.lstrip(".")
@@ -544,6 +566,9 @@ def main():
         sys.exit("[patcher] apktool d failed:\n" + r.stderr[-2000:])
     if not os.path.isdir(work_apk):
         sys.exit("[patcher] apktool produced no output dir")
+
+    # 1b. base__abi split -> universal: drop split-required attrs/meta-data
+    strip_split_metadata(os.path.join(work_apk, "AndroidManifest.xml"))
 
     # 2. native lib
     libdir = os.path.join(work_apk, "lib", "arm64-v8a")
