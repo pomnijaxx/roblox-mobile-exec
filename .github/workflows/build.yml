@@ -141,11 +141,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export PATH="$ANDROID_HOME/build-tools/34.0.0:$PATH"
           python3 apktool/patcher.py \
             --apk roblox_universal.apk \
             --lib librobloxexec.so \
             --smali-dir smali_out \
             --out roblox_patched.apk
+          keytool -genkeypair -v -keystore debug.keystore -storepass android \
+            -alias exec -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=RobloxExec, OU=Mobile, O=exec, C=US" 2>/dev/null || true
+          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -f 4 roblox_patched.apk roblox_patched_aligned.apk
+          mv roblox_patched_aligned.apk roblox_patched.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks debug.keystore \
+            --ks-pass pass:android --key-pass pass:android \
+            --out roblox_patched_signed.apk roblox_patched.apk
+          mv roblox_patched_signed.apk roblox_patched.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --print-certs roblox_patched.apk
           ls -la roblox_patched.apk
 
       - uses: actions/upload-artifact@v4
