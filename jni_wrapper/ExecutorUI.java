@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
@@ -17,6 +18,7 @@ import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
@@ -47,6 +49,7 @@ public final class ExecutorUI {
 
     private static WindowManager sWm;
     private static View sOverlay;
+    private static View sBubble;
     private static EditText sScript;
     private static TextView sLog;
 
@@ -151,6 +154,109 @@ public final class ExecutorUI {
             sLog = null;
             }
         });
+    }
+
+    /**
+     * Floating "EX" bubble shown right after injection, on the Roblox home
+     * page. Tap toggles the console; drag moves it. This gives an instant
+     * visual confirmation that the injection ran (no notification needed).
+     */
+    public static void ensureBubble(final Context ctx) {
+        if (ctx == null) return;
+        UI.post(new Runnable() {
+            public void run() {
+            try {
+                if (sBubble != null) return;
+                Context app = ctx.getApplicationContext();
+                if (!canDrawOverlays(app)) {
+                    appendLog("[ui] overlay permission required — opening settings");
+                    openOverlaySettings(app);
+                    return;
+                }
+                sWm = (WindowManager) app.getSystemService(Context.WINDOW_SERVICE);
+                if (sWm == null) return;
+
+                final View b = buildBubble(app);
+                sBubble = b;
+
+                int size = dp(app, 56);
+                int type = Build.VERSION.SDK_INT >= 26
+                        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                        : WindowManager.LayoutParams.TYPE_PHONE;
+                final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                        size, size, type,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT);
+                lp.gravity = Gravity.TOP | Gravity.END;
+                lp.x = dp(app, 12);
+                lp.y = dp(app, 140);
+
+                b.setOnTouchListener(new View.OnTouchListener() {
+                    private float downX, downY;
+                    private int startX, startY;
+                    private boolean dragging;
+
+                    public boolean onTouch(View v, MotionEvent ev) {
+                        switch (ev.getActionMasked()) {
+                            case MotionEvent.ACTION_DOWN:
+                                downX = ev.getRawX();
+                                downY = ev.getRawY();
+                                startX = lp.x;
+                                startY = lp.y;
+                                dragging = false;
+                                return true;
+                            case MotionEvent.ACTION_MOVE:
+                                float dx = ev.getRawX() - downX;
+                                float dy = ev.getRawY() - downY;
+                                if (!dragging
+                                        && (Math.abs(dx) > dp(app, 6)
+                                            || Math.abs(dy) > dp(app, 6))) {
+                                    dragging = true;
+                                }
+                                if (dragging) {
+                                    lp.x = startX + (int) dx;
+                                    lp.y = startY + (int) dy;
+                                    try {
+                                        sWm.updateViewLayout(b, lp);
+                                    } catch (Throwable ignored) {
+                                    }
+                                }
+                                return true;
+                            case MotionEvent.ACTION_UP:
+                                if (!dragging) {
+                                    if (sOverlay != null) hideOverlay();
+                                    else showOverlay(app);
+                                }
+                                return true;
+                        }
+                        return false;
+                    }
+                });
+
+                sWm.addView(b, lp);
+                Log.i(TAG, "bubble shown — injection alive");
+            } catch (Throwable t) {
+                Log.w(TAG, "ensureBubble failed", t);
+            }
+            }
+        });
+    }
+
+    private static View buildBubble(Context app) {
+        int size = dp(app, 56);
+        TextView tv = new TextView(app);
+        tv.setText("EX");
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.OVAL);
+        gd.setColor(0xE61E7E34);
+        gd.setStroke(dp(app, 2), 0xFF4CFF88);
+        tv.setBackground(gd);
+        return tv;
     }
 
     /** Append a line to the console log (thread-safe). */

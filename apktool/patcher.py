@@ -348,6 +348,8 @@ __UI_HOOK__
 UI_HOOK_SMALI = """\
     invoke-static {p0}, Lroblox/executor/ExecutorUI;->ensureNotification(Landroid/content/Context;)V
 
+    invoke-static {p0}, Lroblox/executor/ExecutorUI;->ensureBubble(Landroid/content/Context;)V
+
     invoke-static {p0}, Lroblox/executor/ScriptLoader;->autoExec(Landroid/content/Context;)V
 """
 
