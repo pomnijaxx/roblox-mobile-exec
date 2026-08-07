@@ -32,11 +32,14 @@
 #include "memops.h"
 #include "exec_state.h"
 
-// DIAGNOSTIC BUILD FLAG — set to 1 to SKIP inline hook patching entirely.
-// Confirms whether the .text patch on lua_pcall is what triggers Roblox's
-// integrity/tamper check (2s smooth -> freeze -> ANR -> crash).
-#ifndef RBLX_DIAG_NOHOOKS
-#define RBLX_DIAG_NOHOOKS 1
+// HOOK INSTALL MODE:
+//   0 = normal (loadstring + pcall detours)
+//   1 = diagnostic — no hooks at all (proved .text patch triggers tamper)
+//   2 = probe — hook lua_tolstring ONLY (chain-only). If the game survives,
+//       the anti-tamper scanner is watching pcall/loadstring specifically and
+//       we can execute via raw pcall pointer from a non-critical detour.
+#ifndef RBLX_HOOK_MODE
+#define RBLX_HOOK_MODE 2
 #endif
 #define LOG_TAG "RobloxExec"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -66,10 +69,12 @@ extern "C" JNIEXPORT void *rblx_loader_callback_ref(void) { return (void*)g_load
 
 static rblx_Hook g_hook_loadstring{};
 static rblx_Hook g_hook_pcall{};
+static rblx_Hook g_hook_tolstring{};
 static rblx_ExecEnv g_env{};
 
 extern "C" void *rblx_trampoline_loadstring(void){ return g_hook_loadstring.active ? g_hook_loadstring.trampoline : nullptr; }
 extern "C" void *rblx_trampoline_pcall(void){ return g_hook_pcall.active ? g_hook_pcall.trampoline : nullptr; }
+extern "C" void *rblx_trampoline_tolstring(void){ return g_hook_tolstring.active ? g_hook_tolstring.trampoline : nullptr; }
 
 /* ---- queued user script ------------------------------------------------
  * jni_exec() (UI thread) only BINDS the engine + enqueues the source. The
@@ -112,6 +117,7 @@ rblx_lua_State *rblx_state_current(void) {
  * sandbox script cannot forge that without a native handle.            */
 typedef int (*ls_orig_t)(rblx_lua_State*, const char*, const char*);
 typedef int (*pc_orig_t)(rblx_lua_State*, int, int, int);
+typedef const char* (*ts_orig_t)(rblx_lua_State*, int, size_t*);
 
 static int unc_load_dispatcher(rblx_lua_State *L, int nargs, int nres, int ef){
 	pc_orig_t tramp = reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
@@ -131,8 +137,7 @@ static int detour_ls_entry(rblx_lua_State *L, const char* src, const char* name)
 	ls_orig_t tramp = reinterpret_cast<ls_orig_t>(rblx_trampoline_loadstring());
 	return tramp ? tramp(L, src, name) : 0;   // propagate original status
 }
-static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf){
-	g_cur=L;
+static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf){	g_cur=L;
 	pump_pending(L);                     // run queued user script on the game thread
 	g_unc_depth++;                      // block re-entrant UNC dispatch
 	pc_orig_t tramp=reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
@@ -141,14 +146,39 @@ static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf)
 	if (r && r<=5) LOGV("lua_pcall => %d (L=%p)", r, (void*)L);
 	return r;
 }
+/* PROBE detour: lua_tolstring chain-only (no pump yet). If this survives
+ * in-game, the tamper scanner watches pcall/loadstring specifically.      */
+static const char* detour_ts_entry(rblx_lua_State *L, int idx, size_t *len){
+	g_cur=L;
+	ts_orig_t tramp = reinterpret_cast<ts_orig_t>(rblx_trampoline_tolstring());
+	return tramp ? tramp(L, idx, len) : nullptr;
+}
 
 /* ---- inline-hook installer ---- */
 static int install_hooks(void) {
-#if RBLX_DIAG_NOHOOKS
-	LOGI("DIAGNOSTIC BUILD: hook patching SKIPPED by design (RBLX_DIAG_NOHOOKS=1)");
-	return 0;
-#endif
 	int rc = 0;
+#if RBLX_HOOK_MODE == 1
+	LOGI("DIAGNOSTIC BUILD: hook patching SKIPPED by design (RBLX_HOOK_MODE=1)");
+	return 0;
+#elif RBLX_HOOK_MODE == 2
+	LOGI("PROBE BUILD: hooking lua_tolstring ONLY (RBLX_HOOK_MODE=2)");
+	if (g_sym.lua_tolstring) {
+		if (g_mod_valid && !rblx_addr_in_module(&g_mod, (void*)g_sym.lua_tolstring)) {
+			LOGE("tolstring %p outside module — refusing to hook (poisoned symbol)",
+			     (void*)g_sym.lua_tolstring);
+			g_sym.lua_tolstring = nullptr;
+		} else {
+			int z = rblx_hook_install(&g_hook_tolstring,
+			                          (void*)g_sym.lua_tolstring,
+			                          (void*)detour_ts_entry, 16);
+			if (z == 0) g_hooks_active = true;
+			else { rc--; LOGE("tolstring hook fail %d", z); }
+		}
+	}
+	LOGI("install_hooks(PROBE tolstring) rc=%d hooks_active=%d", rc, (int)g_hooks_active);
+	return rc;  // 0 == all good (or none present)
+#else
+	LOGI("NORMAL BUILD: hooking loadstring + pcall (RBLX_HOOK_MODE=0)");
 	if (g_sym.luaL_loadstring) {
 		if (g_mod_valid && !rblx_addr_in_module(&g_mod, (void*)g_sym.luaL_loadstring)) {
 			LOGE("loadstring %p outside module — refusing to hook (poisoned symbol)",
@@ -177,6 +207,7 @@ static int install_hooks(void) {
 	}
 	LOGI("install_hooks rc=%d hooks_active=%d", rc, (int)g_hooks_active);
 	return rc;  // 0 == all good (or none present)
+#endif
 }
 
 /* ---- symbol resolution (in-memory ELF dynsym walk; NO dlopen) ---- */
@@ -660,6 +691,7 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void * /*reserved*/) 
 	(void)vm;  /* unused beyond diagnostics */
 	rblx_hook_remove(&g_hook_pcall);
 	rblx_hook_remove(&g_hook_loadstring);
+	rblx_hook_remove(&g_hook_tolstring);
 	LOGI("librobloxexec.so unloaded");
 }
 

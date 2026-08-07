@@ -75,6 +75,7 @@ rblx_lua_State *rblx_state_current(void);   /* live lua_State* (g_cur or resolve
  * (avoids recursion). Returns NULL when the hook was not installed.       */
 void *rblx_trampoline_loadstring(void);
 void *rblx_trampoline_pcall(void);
+void *rblx_trampoline_tolstring(void);
 bool  rblx_in_trusted_loader(void);        /* true iff sUNC loader-frame armed*/
 
 #ifdef __cplusplus
