@@ -106,27 +106,55 @@ int rblx_find_module(const char *basename, rblx_Module *out) {
 	tmp.size   = (size_t)((uint8_t*)last_end - (uint8_t*)first_base);
 	strncpy(tmp.name, basename, sizeof(tmp.name) - 1);
 
-	/* Parse ELF section tables straight from memory to recover sections     */
+	/* Parse ELF PROGRAM headers straight from memory to recover layout.
+	 * Deliberately NOT the section header table: on this engine the shdr
+	 * table lands in the zero-filled tail of the last PT_LOAD, so reading
+	 * it yields garbage string-table pointers and strcmp(".text") SIGSEGVs.
+	 * PT_LOAD segments are what the kernel actually mapped — always valid. */
 	Elf64_Ehdr *ehdr = (Elf64_Ehdr*)tmp.base;
-	if (ehdr->e_ident[EI_MAG0] != ELFMAG0) {
+	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
 		LOGE("module %s: bad elf magic @ %p (not pure ELF map?)",
 		     tmp.name, tmp.base);
 		memcpy(out, &tmp, sizeof(*out));
 		return 0;  // still useful: base/size only
 	}
-	Elf64_Shdr *sh = (Elf64_Shdr*)((uint8_t*)tmp.base + ehdr->e_shoff);
-	const char *strtab = (const char*)tmp.base +
-		sh[ehdr->e_shstrndx].sh_offset;
-	for (int i = 0; i < ehdr->e_shnum; i++) {
-		const char *name = strtab + sh[i].sh_name;
-		size_t runtime_off = sh[i].sh_addr;   // sh_addr is file VA w/ bias
-		if (strcmp(name, ".text") == 0)      { tmp.text_off  = runtime_off;
-		                                      tmp.text_size = sh[i].sh_size; }
-		else if (strcmp(name, ".data") == 0){ tmp.data_off   = runtime_off;
-		                                      tmp.data_size  = sh[i].sh_size; }
-		else if (strcmp(name, ".bss") == 0)  { tmp.bss_off    = runtime_off;
-		                                      /* size implicit */ }
+	size_t msize = tmp.size;
+	if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0 || ehdr->e_phnum > 256 ||
+	    ehdr->e_phoff >= msize ||
+	    (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr) > msize - ehdr->e_phoff) {
+		LOGW("module %s: phdr out of range, using base/size only", tmp.name);
+		memcpy(out, &tmp, sizeof(*out));
+		return 0;
 	}
+	const Elf64_Phdr *ph =
+		(const Elf64_Phdr*)((uint8_t*)tmp.base + ehdr->e_phoff);
+
+	/* load bias: runtime addr = bias + link-time p_vaddr */
+	uintptr_t bias = (uintptr_t)tmp.base;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (ph[i].p_type == PT_LOAD && ph[i].p_offset == 0) {
+			bias = (uintptr_t)tmp.base - (uintptr_t)ph[i].p_vaddr;
+			break;
+		}
+	}
+	/* first RX LOAD = .text ; first RW LOAD = .data ; .bss = RW memsz tail */
+	uintptr_t bss_va = 0;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (ph[i].p_type != PT_LOAD) continue;
+		uintptr_t va = bias + ph[i].p_vaddr;
+		if (ph[i].p_flags & PF_X) {
+			if (!tmp.text_off) {
+				tmp.text_off  = va - (uintptr_t)tmp.base;
+				tmp.text_size = ph[i].p_filesz;
+			}
+		}
+		if (ph[i].p_flags & PF_W) {
+			if (!tmp.data_off) tmp.data_off = va - (uintptr_t)tmp.base;
+			if (ph[i].p_memsz > ph[i].p_filesz)
+				bss_va = va + ph[i].p_filesz;   /* last RW tail wins */
+		}
+	}
+	if (bss_va) tmp.bss_off = bss_va - (uintptr_t)tmp.base;
 	LOGI("module %-20s base=%p end=%p  text@%#zx/%#zx  data@%#zx  bss@%#zx",
 	     tmp.name, tmp.base, tmp.end,
 	     tmp.text_off, tmp.text_size, tmp.data_off, tmp.bss_off);
@@ -201,9 +229,14 @@ bool rblx_addr_in_module(const rblx_Module *mod, const void *addr) {
 void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
 	if (!mod || !mod->base || !name) return NULL;
 	uint8_t *base = (uint8_t*)mod->base;
+	size_t msize = mod->size ? mod->size
+	              : (size_t)((uint8_t*)mod->end - base);
 	Elf64_Ehdr *ehdr = (Elf64_Ehdr*)base;
 	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return NULL;
-	if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return NULL;
+	if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0 || ehdr->e_phnum > 256 ||
+	    ehdr->e_phoff >= msize ||
+	    (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr) > msize - ehdr->e_phoff)
+		return NULL;
 
 	Elf64_Phdr *ph = (Elf64_Phdr*)(base + ehdr->e_phoff);
 
@@ -216,11 +249,14 @@ void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
 			break;
 		}
 	}
+	uintptr_t lo = (uintptr_t)base, hi = lo + msize;
 
 	const Elf64_Dyn *dyn = NULL;
 	for (int i = 0; i < ehdr->e_phnum; i++) {
 		if (ph[i].p_type == PT_DYNAMIC) {
-			dyn = (const Elf64_Dyn*)(bias + ph[i].p_vaddr);
+			uintptr_t da = bias + ph[i].p_vaddr;
+			if (da >= lo && da < hi)
+				dyn = (const Elf64_Dyn*)da;
 			break;
 		}
 	}
@@ -228,7 +264,8 @@ void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
 
 	uintptr_t symtab = 0, strtab = 0, hash = 0, gnu_hash = 0;
 	size_t syment = sizeof(Elf64_Sym);
-	for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+	for (const Elf64_Dyn *d = dyn, *dend = dyn + 4096;
+	     d->d_tag != DT_NULL && d < dend; d++) {
 		switch (d->d_tag) {
 			case DT_SYMTAB: symtab  = d->d_un.d_ptr; break;
 			case DT_STRTAB: strtab  = d->d_un.d_ptr; break;
@@ -239,6 +276,11 @@ void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
 		}
 	}
 	if (!symtab || !strtab || syment == 0) return NULL;
+	/* only trust in-module pointers */
+	if (bias + symtab < lo || bias + symtab >= hi) return NULL;
+	if (bias + strtab < lo || bias + strtab >= hi) return NULL;
+	if (hash && (bias + hash < lo || bias + hash >= hi)) hash = 0;
+	if (gnu_hash && (bias + gnu_hash < lo || bias + gnu_hash >= hi)) gnu_hash = 0;
 
 	/* symbol count: SysV hash nchain, else walk GNU hash buckets, else cap */
 	size_t nsyms = 0;
@@ -278,6 +320,7 @@ void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
 		unsigned t = ELF64_ST_TYPE(s->st_info);
 		if (t != STT_FUNC && t != STT_OBJECT) continue;
 		const char *nm = strs + s->st_name;
+		if ((uintptr_t)nm < lo || (uintptr_t)nm >= hi) continue;  /* guard */
 		if (strcmp(nm, name) == 0)
 			return (void*)(bias + s->st_value);
 	}
