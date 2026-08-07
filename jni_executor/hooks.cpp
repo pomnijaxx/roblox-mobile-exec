@@ -14,10 +14,16 @@
 #define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, "HookH", fmt, ##__VA_ARGS__)
 
 /* 16-byte ARM64 indirect-jump stub:
- *      ldr  x16, [pc, #8]   = 0x18400040   (imm19 = 2 -> addr+8)
+ *      ldr  x16, [pc, #8]   = 0x58000050   (64-bit LDR literal, imm19=2)
  *      br   x16             = 0xD61F0200
  *      <u64 target>         (placed at pc+8 from the ldr)            */
-static const uint32_t INST_LDR_X16 = 0x18400040u;
+/* NOTE: 0x18400040 was WRONG — that decodes as 32-bit `ldr w0,[pc,#+0x80008]`
+ * (top byte 0x18, Rt=0, imm19=131074) so x16 was never loaded and `br x16`
+ * branched to garbage → deterministic crash on the first live pcall even
+ * though the hook "verified" (verify only checks bytes landed, not that the
+ * instruction stream is valid). 0x58000050 = `ldr x16,[pc,#8]` (opc=01
+ * 64-bit, imm19=2, Rt=16), which pairs with the constant at +8.          */
+static const uint32_t INST_LDR_X16 = 0x58000050u;
 static const uint32_t INST_BR_X16  = 0xD61F0200u;
 
 static size_t pg_size(){
@@ -75,7 +81,17 @@ int rblx_hook_install(rblx_Hook *h, void *target, void *detour, int min_bytes){
 	((uint32_t*)full)[0]=INST_LDR_X16; ((uint32_t*)full)[1]=INST_BR_X16;
 	((uint64_t*)(full+8))[0]=(uint64_t)detour;
 	memcpy(h->patch,full,patch);
-	if(rblx_writemem(target,full,patch)!=0){ LOGE("patch write failed"); return -5; }
+	/* race-safe order: write the u64 constant (bytes 8-15) FIRST so any
+	 * core that fetches the new LDR always reads the complete detour addr,
+	 * then write the instruction pair (bytes 0-7) back-to-back. A reader
+	 * therefore sees: original prologue, or new-LDR + constant (no branch
+	 * taken — harmless x16 clobber), or the full new entry. The residual
+	 * torn case (old instr0 + new BR) is a few-ns window, same as
+	 * Substrate/And64 accept.                                         */
+	if(rblx_writemem((uint8_t*)target + 8, full + 8, 8)!=0){
+		LOGE("patch const write failed"); return -5;
+	}
+	if(rblx_writemem(target, full, 8)!=0){ LOGE("patch write failed"); return -5; }
 	__builtin___clear_cache((char*)target,(char*)target+patch);
 
 	/* verify the patch actually landed before declaring success */
