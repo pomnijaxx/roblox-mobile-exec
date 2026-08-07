@@ -370,9 +370,14 @@ static void pump_pending(rblx_lua_State *L) {
 			 * top, or nil on compile failure. Check the type — calling
 			 * nil blindly yields "attempt to call a nil value" instead
 			 * of a contained syntax error. Validated in harness.       */
+			/* RE: Roblox type tags differ from stock Lua (string tt=6,
+			 * function tt=8 at TValue+0xc; lua_type returns tt raw).
+			 * The loadstring error path pushes nil (tt=0) first — so the
+			 * robust discriminator is "not nil" (0 in every Lua variant),
+			 * NOT "== function" (6 stock vs 8 Roblox). */
 			int t = g_sym.lua_type ? g_sym.lua_type(L, -1)
-			                       : RBLX_LUA_TFUNCTION;
-			if (t == RBLX_LUA_TFUNCTION) {
+			                       : RBLX_LUA_TNIL;
+			if (t != RBLX_LUA_TNIL) {
 				rc = pc(L, 0, 0, 0); /* run the chunk (net stack balance) */
 			} else {
 				rc = RBLX_LUA_ERRSYNTAX;
