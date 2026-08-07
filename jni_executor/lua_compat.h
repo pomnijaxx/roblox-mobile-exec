@@ -54,6 +54,10 @@ typedef void                  (*rblx_luaL_openlibs_t)(rblx_lua_State *);
 typedef int                   (*rblx_luaL_loadstring_t)(rblx_lua_State *,
                                                         const char *,
                                                         const char *);
+/* Roblox's engine `loadstring` is registered as a plain C closure:
+ * int luaB_loadstring(lua_State* L) — reads arg 1 (source) from the stack,
+ * returns 1 (compiled chunk on top) or 2 (nil, err on top).               */
+typedef int                   (*rblx_luaB_loadstring_t)(rblx_lua_State *);
 typedef int                   (*rblx_luaL_loadbuffer_t)(rblx_lua_State *,
                                                         const char *, size_t,
                                                         const char *);
@@ -84,6 +88,8 @@ typedef void                  (*rblx_lua_pushinteger_t)(rblx_lua_State *,
                                                         rblx_LuaInteger);
 typedef const char *          (*rblx_lua_tostring_t)(rblx_lua_State *,
                                                      int);
+typedef const char *          (*rblx_lua_tolstring_t)(rblx_lua_State *,
+                                                      int, size_t *);
 typedef rblx_LuaInteger       (*rblx_lua_tointeger_t)(rblx_lua_State *,
                                                       int);
 typedef int                   (*rblx_lua_isnumber_t)(rblx_lua_State *,

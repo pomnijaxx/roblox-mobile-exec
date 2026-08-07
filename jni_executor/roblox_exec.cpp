@@ -220,6 +220,33 @@ static int bind_symbols(const rblx_Module *mod) {
 	R(lua_pushlstring);
 #undef R
 
+	/* Engine-version-pinned fallback: this APK's libroblox.so exports NO
+	 * lua_* symbols (hidden visibility / stripped Luau), so the dynsym walk
+	 * above finds nothing. The offsets below are the link-time VAs recovered
+	 * by offline RE of the EXACT same binary (fix3_build/elf_check). Runtime
+	 * address = module load bias + link VA: the off-0 PT_LOAD of this .so
+	 * has p_vaddr 0, so bias == mod->base. Fallbacks only fill what dlsym
+	 * already resolved (they never overwrite a live symbol).               */
+#define FB(NAME, OFF) do {                                                    \
+	if (!g_sym.NAME && mod->base) {                                          \
+		g_sym.NAME = (decltype(g_sym.NAME))((uint8_t*)mod->base + (OFF));   \
+		any = true;                                                        \
+		LOGI("fb " #NAME " <- base+0x%llx = %p",                            \
+		     (unsigned long long)(OFF), (void*)g_sym.NAME);                \
+	}                                                                        \
+} while (0)
+	FB(lua_pcall,         0x5b4f2cc);   /* luaB_pcall → luaD_pcall          */
+	FB(lua_pushstring,    0x2229bf0);
+	FB(lua_pushlstring,   0x5b4d6c8);
+	FB(lua_pushnil,       0x222a0dc);
+	FB(lua_gettop,        0x223ca6c);
+	FB(lua_settop,        0x2228e68);
+	FB(lua_next,          0x224f768);
+	FB(lua_type,          0x2228e00);
+	FB(lua_tolstring,     0x223d140);   /* NULL-len safe (cbz x19)           */
+	FB(luaB_loadstring,   0x3a53f8c);   /* engine global loadstring closure  */
+#undef FB
+
 	/* alias fixup: some builds name loadstring differently */
 	if (!g_sym.luaL_loadstring) {
 		g_sym.luaL_loadstring =
@@ -231,9 +258,9 @@ static int bind_symbols(const rblx_Module *mod) {
 	g_sym.module_base = mod->base;
 	g_sym.module_size = mod->size;
 
-	LOGI("symbols: load=%p pcall=%p newstate=%p type=%p",
-	     g_sym.luaL_loadstring, g_sym.lua_pcall, g_sym.luaL_newstate,
-	     g_sym.lua_type);
+	LOGI("symbols: load=%p ls_ro=%p pcall=%p newstate=%p type=%p tolstr=%p",
+	     g_sym.luaL_loadstring, g_sym.luaB_loadstring, g_sym.lua_pcall,
+	     g_sym.luaL_newstate, g_sym.lua_type, g_sym.lua_tolstring);
 	return any ? 0 : -102;
 }
 
@@ -244,7 +271,8 @@ static int bind_symbols(const rblx_Module *mod) {
  * inside libRoblox's executable region (the state's vtable region).
  */
 static int resolve_lua_state(const rblx_Module *mod) {
-	if (!mod || !g_sym.luaL_loadstring) return -1;
+	if (!mod || (!g_sym.luaL_loadstring && !g_sym.luaB_loadstring &&
+	             !g_sym.lua_pcall)) return -1;
 	if (!mod->bss_off) return -1;
 	void **scan = (void**)((uint8_t*)mod->base + mod->bss_off);
 	size_t ents = (mod->size > mod->bss_off)
@@ -320,7 +348,23 @@ static void pump_pending(rblx_lua_State *L) {
 	int rc = RBLX_LUA_ERRRUN;
 	ls_orig_t ls = reinterpret_cast<ls_orig_t>(rblx_trampoline_loadstring());
 	pc_orig_t pc = reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
-	if (ls && pc) {
+	/* Preferred path: the engine's OWN global `loadstring` closure
+	 * (luaB_loadstring, int(lua_State*)). Push source → call closure
+	 * (1: chunk on top | 2: nil, err on top) → run the chunk through the
+	 * ORIGINAL lua_pcall trampoline so we never re-enter detour_pc_entry. */
+	if (g_sym.luaB_loadstring && g_sym.lua_pushstring && pc) {
+		int top = g_sym.lua_gettop ? g_sym.lua_gettop(L) : 0;
+		g_sym.lua_pushstring(L, src);
+		int n = g_sym.luaB_loadstring(L);
+		if (n == 1) {
+			rc = pc(L, 0, 0, 0);          /* err msg (if any) on top */
+		} else if (n == 2) {
+			rc = RBLX_LUA_ERRSYNTAX;      /* nil, err on top */
+		} else {
+			rc = RBLX_LUA_ERRRUN;         /* engine refused the chunk */
+			if (g_sym.lua_settop) g_sym.lua_settop(L, top);  /* undo push */
+		}
+	} else if (ls && pc) {
 		int e = ls(L, src, "@executor-injected");
 		if (e == RBLX_LUA_OK) rc = pc(L, 0, 0, 0);
 		else rc = e;
@@ -329,8 +373,9 @@ static void pump_pending(rblx_lua_State *L) {
 		if (e == RBLX_LUA_OK) rc = g_sym.lua_pcall(L, 0, 0, 0);
 		else rc = e;
 	}
-	if (rc != RBLX_LUA_OK && g_sym.lua_tostring) {
-		const char *msg = g_sym.lua_tostring(L, -1);
+	if (rc != RBLX_LUA_OK) {
+		const char *msg = g_sym.lua_tolstring
+		                  ? g_sym.lua_tolstring(L, -1, NULL) : nullptr;
 		LOGW("exec err=%d: %s :: %.180s", rc, msg ? msg : "?", src);
 	}
 
@@ -363,7 +408,7 @@ static int ensure_engine_locked(void) {
 	LOGI("Roblox module  base=%p end=%p size=%zu",
 	     mod.base, mod.end, mod.size);
 
-	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall) {
+	if (!(g_sym.luaL_loadstring || g_sym.luaB_loadstring) || !g_sym.lua_pcall) {
 		if (bind_symbols(&mod) != 0) {
 			LOGE("symbol bind failed fatally");
 			return -101;
@@ -395,14 +440,15 @@ static int jni_exec(JNIEnv *env, jobject thiz, jstring src) {
 	/* Lazy engine bring-up (bind + hooks). At Application.onCreate the
 	 * engine libs are usually not mapped yet, so retry now. Idempotent.   */
 	pthread_mutex_lock(&g_lock);
-	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
+	if (!(g_sym.luaL_loadstring || g_sym.luaB_loadstring) || !g_sym.lua_pcall)
 		ensure_engine_locked();
-	bool ready = g_sym.luaL_loadstring && g_sym.lua_pcall && g_hooks_active;
+	bool ready = (g_sym.luaL_loadstring || g_sym.luaB_loadstring) &&
+	             g_sym.lua_pcall && g_hooks_active;
 	pthread_mutex_unlock(&g_lock);
 	if (!ready) {
-		LOGE("engine not ready (load=%p pcall=%p hooks=%d)",
-		     (void*)g_sym.luaL_loadstring, (void*)g_sym.lua_pcall,
-		     (int)g_hooks_active);
+		LOGE("engine not ready (load=%p ls_ro=%p pcall=%p hooks=%d)",
+		     (void*)g_sym.luaL_loadstring, (void*)g_sym.luaB_loadstring,
+		     (void*)g_sym.lua_pcall, (int)g_hooks_active);
 		env->ReleaseStringUTFChars(src, cstr);
 		return -2;
 	}
@@ -479,8 +525,10 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "%s\n"
 	         "module:%s\n"
 	         "loadstring:%p\n"
+	         "loadstring_ro:%p\n"
 	         "loadbuffer:%p\n"
 	         "pcall:%p\n"
+	         "tolstring:%p\n"
 	         "newstate:%p\n"
 	         "lua_state_ptr:%p\n"
 	         "g_cur:%p\n"
@@ -489,9 +537,12 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "queue:%s\n"
 	         "lua_alive:%s",
 	         found,
-	         (g_sym.luaL_loadstring || g_sym.lua_pcall) ? "bound" : "unbound",
-	         (void*)g_sym.luaL_loadstring, (void*)g_sym.luaL_loadbuffer,
-	         (void*)g_sym.lua_pcall, (void*)g_sym.luaL_newstate,
+	         (g_sym.luaL_loadstring || g_sym.luaB_loadstring ||
+	          g_sym.lua_pcall) ? "bound" : "unbound",
+	         (void*)g_sym.luaL_loadstring, (void*)g_sym.luaB_loadstring,
+	         (void*)g_sym.luaL_loadbuffer,
+	         (void*)g_sym.lua_pcall, (void*)g_sym.lua_tolstring,
+	         (void*)g_sym.luaL_newstate,
 	         (void*)g_sym.lua_state_ptr, (void*)g_cur,
 	         (int)g_hooks_active, (int)g_unc_injected,
 	         g_pending_len ? "busy" : "idle",

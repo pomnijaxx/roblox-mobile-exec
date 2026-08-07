@@ -123,10 +123,20 @@ static int unc_load(rblx_lua_State*L,void*,void*,int){ g_cur=L;
 	if(!src){ L_pushs(""); L_pushs("load: expected string chunk"); return 2; }
 	const char*name=(L_type(2)==RBLX_LUA_TSTRING)?L_ts(2):"@x";
 	rblx_sunc_enter();
-	int err=g_sym.luaL_loadstring?g_sym.luaL_loadstring(L,src,name?name:"@x"):1;
+	int err;
+	if (g_sym.luaB_loadstring && g_sym.lua_pushstring) {
+		/* engine loadstring closure: push source → call → 1:fn | 2:nil,err */
+		g_sym.lua_pushstring(L, src);
+		int n = g_sym.luaB_loadstring(L);
+		err = (n == 1) ? RBLX_LUA_OK
+		     : (n == 2 ? RBLX_LUA_ERRSYNTAX : RBLX_LUA_ERRRUN);
+	} else {
+		err = g_sym.luaL_loadstring ? g_sym.luaL_loadstring(L, src, name?name:"@x") : 1;
+	}
 	rblx_sunc_leave();
 	if(err!=RBLX_LUA_OK){ L_pushs("");
-		const char*m=g_sym.lua_tostring?g_sym.lua_tostring(L,-1):"compile failed";
+		const char*m=g_sym.lua_tolstring?g_sym.lua_tolstring(L,-1,NULL)
+		              :(g_sym.lua_tostring?g_sym.lua_tostring(L,-1):nullptr);
 		L_pushs(m?m:"compile failed"); return 2; // nil,msg
 	}
 	return 1;

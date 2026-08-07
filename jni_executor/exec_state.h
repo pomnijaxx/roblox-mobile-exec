@@ -27,6 +27,7 @@ struct RobloxSymbols {
     rblx_lua_close_t              lua_close;
     rblx_luaL_openlibs_t          luaL_openlibs;
     rblx_luaL_loadstring_t        luaL_loadstring;
+    rblx_luaB_loadstring_t        luaB_loadstring;   /* engine global loadstring closure */
     rblx_luaL_loadbuffer_t        luaL_loadbuffer;
     rblx_luaL_loadbufferx_t       luaL_loadbufferx;
     rblx_lua_pushcclosure_t       lua_pushcclosure;
@@ -41,6 +42,7 @@ struct RobloxSymbols {
     rblx_lua_pushnumber_t         lua_pushnumber;
     rblx_lua_pushinteger_t        lua_pushinteger;
     rblx_lua_tostring_t           lua_tostring;
+    rblx_lua_tolstring_t          lua_tolstring;     /* len may be NULL */
     rblx_lua_tointeger_t          lua_tointeger;
     rblx_lua_tointegerx_t         lua_tointegerx;
     rblx_lua_isnumber_t           lua_isnumber;
