@@ -78,6 +78,15 @@ int rblx_hook_install(rblx_Hook *h, void *target, void *detour, int min_bytes){
 	if(rblx_writemem(target,full,patch)!=0){ LOGE("patch write failed"); return -5; }
 	__builtin___clear_cache((char*)target,(char*)target+patch);
 
+	/* verify the patch actually landed before declaring success */
+	uint8_t chk[16]; memset(chk,0,sizeof chk);
+	if(rblx_readmem(target,chk,patch)!=0 || memcmp(chk,full,patch)!=0){
+		LOGE("hook verify FAILED — restoring original bytes");
+		rblx_writemem(target, backup, patch);
+		__builtin___clear_cache((char*)target,(char*)target+patch);
+		return -6;
+	}
+
 	h->active=true;
 	LOGI("hook OK  target=%p detour=%p tramp=%p resume@%p  insns=%08x,%08x",
 	     target,detour,tramp,(void*)((uint8_t*)target+patch),

@@ -272,7 +272,10 @@ int rblx_unc_init(rblx_lua_State*L, const rblx_ExecEnv*env){
 	if(!L) return -1;
 	if(env) memcpy(&g_env_lcl, env, sizeof(g_env_lcl));
 	rblx_sunc_register_state(L);
-	if(g_sym.luaL_openlibs) g_sym.luaL_openlibs(L);
+	/* NOTE: no luaL_openlibs here — re-opening stdlibs on Roblox's live
+	 * global state replaces their customized functions and corrupts the
+	 * running game. The state is already fully initialized by the engine;
+	 * we only attach our own globals below. */
 	bind_global("getfidelity","getfidelity",unc_getfidelity);
 	bind_global("load",        nullptr,     unc_load);
 	bind_global("checkcaller","checkcaller",unc_checkcaller);

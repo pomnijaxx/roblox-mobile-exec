@@ -186,6 +186,105 @@ void *rblx_scan_module(const rblx_Module *mod, const rblx_Pattern *pat) {
 }
 
 /*
+ * ---- In-memory dynamic symbol resolution (namespace-safe) ----------------
+ * dlsym(RTLD_DEFAULT) cannot see libs that were loaded into a private linker
+ * namespace, and plain dlopen("libroblox.so", ...) may *load a second copy*
+ * of the engine (huge RAM spike on this device → LMK kill). Instead we walk
+ * the already-mapped module's PT_DYNAMIC → DT_SYMTAB/DT_STRTAB directly.
+ */
+bool rblx_addr_in_module(const rblx_Module *mod, const void *addr) {
+	if (!mod || !mod->base || !mod->end || !addr) return false;
+	uintptr_t a = (uintptr_t)addr;
+	return a >= (uintptr_t)mod->base && a < (uintptr_t)mod->end;
+}
+
+void *rblx_dlsym_module(const rblx_Module *mod, const char *name) {
+	if (!mod || !mod->base || !name) return NULL;
+	uint8_t *base = (uint8_t*)mod->base;
+	Elf64_Ehdr *ehdr = (Elf64_Ehdr*)base;
+	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return NULL;
+	if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return NULL;
+
+	Elf64_Phdr *ph = (Elf64_Phdr*)(base + ehdr->e_phoff);
+
+	/* load bias: runtime address = bias + link-time VA.
+	 * Android .so files usually map file offset 0 at p_vaddr 0 (bias = base). */
+	uintptr_t bias = (uintptr_t)base;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (ph[i].p_type == PT_LOAD && ph[i].p_offset == 0) {
+			bias = (uintptr_t)base - (uintptr_t)ph[i].p_vaddr;
+			break;
+		}
+	}
+
+	const Elf64_Dyn *dyn = NULL;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (ph[i].p_type == PT_DYNAMIC) {
+			dyn = (const Elf64_Dyn*)(bias + ph[i].p_vaddr);
+			break;
+		}
+	}
+	if (!dyn) return NULL;
+
+	uintptr_t symtab = 0, strtab = 0, hash = 0, gnu_hash = 0;
+	size_t syment = sizeof(Elf64_Sym);
+	for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+		switch (d->d_tag) {
+			case DT_SYMTAB: symtab  = d->d_un.d_ptr; break;
+			case DT_STRTAB: strtab  = d->d_un.d_ptr; break;
+			case DT_HASH:   hash    = d->d_un.d_ptr; break;
+			case DT_GNU_HASH: gnu_hash = d->d_un.d_ptr; break;
+			case DT_SYMENT: syment  = d->d_un.d_val; break;
+			default: break;
+		}
+	}
+	if (!symtab || !strtab || syment == 0) return NULL;
+
+	/* symbol count: SysV hash nchain, else walk GNU hash buckets, else cap */
+	size_t nsyms = 0;
+	if (hash) {
+		const uint32_t *h = (const uint32_t*)(bias + hash);
+		nsyms = h[1];                                  /* nchain */
+	} else if (gnu_hash) {
+		const uint32_t *gh = (const uint32_t*)(bias + gnu_hash);
+		uint32_t nbuckets = gh[0], symoffset = gh[1], bloom_size = gh[2];
+		const uint64_t *bloom  = (const uint64_t*)(gh + 4);
+		const uint32_t *buckets = (const uint32_t*)(bloom + bloom_size);
+		const uint32_t *chain   = buckets + nbuckets;
+		uint32_t maxidx = symoffset;
+		uint64_t guard = 0;
+		for (uint32_t b = 0; b < nbuckets && guard < (1u<<20); b++) {
+			uint32_t idx = buckets[b];
+			if (idx == 0) continue;
+			uint32_t si = idx;
+			for (;;) {
+				guard++;
+				if (si > maxidx) maxidx = si;
+				uint32_t cur = chain[si - symoffset];
+				if (cur & 1) break;
+				si++;
+			}
+		}
+		nsyms = maxidx + 1;
+	}
+	if (nsyms == 0) nsyms = (1u<<20);                  /* safety cap */
+	if (nsyms > (1u<<20)) nsyms = (1u<<20);
+
+	const Elf64_Sym *syms = (const Elf64_Sym*)(bias + symtab);
+	const char *strs = (const char*)(bias + strtab);
+	for (size_t i = 0; i < nsyms; i++) {
+		const Elf64_Sym *s = &syms[i];
+		if (s->st_name == 0 || s->st_value == 0) continue;
+		unsigned t = ELF64_ST_TYPE(s->st_info);
+		if (t != STT_FUNC && t != STT_OBJECT) continue;
+		const char *nm = strs + s->st_name;
+		if (strcmp(nm, name) == 0)
+			return (void*)(bias + s->st_value);
+	}
+	return NULL;
+}
+
+/*
  * ---- raw R/W -------------------------------------------------------------- */
 static int page_protect_ok(void *addr, size_t n) {
 	return mprotect((void*)((uintptr_t)addr & ~(0xFFFull)),

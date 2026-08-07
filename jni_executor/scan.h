@@ -78,6 +78,18 @@ void     rblx_write_u64(void *addr, uint64_t v);
 /* ARM64-specific: follow a 2-operand ADRP/ADD pair to recover a data pointer. */
 void *rblx_adrp_add_resolve(void *insn); /* insn points @ the ADRP            */
 
+/*
+ * Resolve a symbol by walking the in-memory ELF dynamic symbol table of a
+ * module found via rblx_find_module(). Works even when the lib was loaded
+ * into a private linker namespace where dlsym(RTLD_DEFAULT) cannot see it,
+ * and NEVER triggers a new load of the module (no OOM risk on the device).
+ * Returns the runtime address or NULL.
+ */
+void *rblx_dlsym_module(const rblx_Module *mod, const char *name);
+
+/* True if addr lies inside the module's mapped range [base, end). */
+bool rblx_addr_in_module(const rblx_Module *mod, const void *addr);
+
 #ifdef __cplusplus
 }
 #endif

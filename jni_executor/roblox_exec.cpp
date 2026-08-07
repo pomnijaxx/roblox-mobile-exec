@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 #include "lua_compat.h"
 #include "scan.h"
@@ -45,6 +47,11 @@ static bool      g_hooks_active  = false;
 static bool      g_unc_injected  = false;       /* UNC family injected at least once */
 static pthread_mutex_t g_lock    = PTHREAD_MUTEX_INITIALIZER;
 
+/* Last engine module resolved from /proc/self/maps; used to validate that a
+ * dlsym'd symbol actually lives INSIDE the engine before we hook it.        */
+static rblx_Module g_mod{};
+static bool        g_mod_valid = false;
+
 /* Native-side JNI handles reached by the UNC/HTTP surface in adjacent TUs.
  * Declared extern "C" so the C++ (and future C) object layout stays ABI-wide
  * one symbol, and to avoid forcing every caller to know about jni.h. */
@@ -57,6 +64,22 @@ static rblx_ExecEnv g_env{};
 
 extern "C" void *rblx_trampoline_loadstring(void){ return g_hook_loadstring.active ? g_hook_loadstring.trampoline : nullptr; }
 extern "C" void *rblx_trampoline_pcall(void){ return g_hook_pcall.active ? g_hook_pcall.trampoline : nullptr; }
+
+/* ---- queued user script ------------------------------------------------
+ * jni_exec() (UI thread) only BINDS the engine + enqueues the source. The
+ * script itself is executed by pump_pending() from inside the lua_pcall
+ * detour, i.e. ON ROBLOX'S OWN SCRIPT THREAD with its real live lua_State.
+ * Calling lua_pcall on the live game state from a foreign thread races with
+ * the VM and corrupts it (delayed crash) — this design eliminates that.   */
+#define RBLX_QUEUE_MAX (1u<<16)
+static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_queue_cv = PTHREAD_COND_INITIALIZER;
+static char    g_pending[RBLX_QUEUE_MAX];
+static size_t  g_pending_len   = 0;
+static int     g_pending_rc    = RBLX_LUA_OK;
+static bool    g_pending_done  = false;
+
+static void pump_pending(rblx_lua_State *L);   /* defined after do_inject_unc */
 
 /* thread-local call depth: protects the sUNC detour path from re-entry */
 static __thread int g_unc_depth;
@@ -104,6 +127,7 @@ static int detour_ls_entry(rblx_lua_State *L, const char* src, const char* name)
 }
 static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf){
 	g_cur=L;
+	pump_pending(L);                     // run queued user script on the game thread
 	g_unc_depth++;                      // block re-entrant UNC dispatch
 	pc_orig_t tramp=reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
 	int r = tramp ? tramp(L,nargs,nresults,errf) : 0;
@@ -116,48 +140,50 @@ static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf)
 static int install_hooks(void) {
 	int rc = 0;
 	if (g_sym.luaL_loadstring) {
-		// We patch the live symbol; detour chains into the trampoline.
-		int z = rblx_hook_install(&g_hook_loadstring,
-		                          (void*)g_sym.luaL_loadstring,
-		                          (void*)detour_ls_entry, 16);
-		if (z == 0) g_hooks_active = true;
-		else { rc--; LOGE("loadstring hook fail %d", z); }
+		if (g_mod_valid && !rblx_addr_in_module(&g_mod, (void*)g_sym.luaL_loadstring)) {
+			LOGE("loadstring %p outside module — refusing to hook (poisoned symbol)",
+			     (void*)g_sym.luaL_loadstring);
+			g_sym.luaL_loadstring = nullptr;
+		} else {
+			int z = rblx_hook_install(&g_hook_loadstring,
+			                          (void*)g_sym.luaL_loadstring,
+			                          (void*)detour_ls_entry, 16);
+			if (z == 0) g_hooks_active = true;
+			else { rc--; LOGE("loadstring hook fail %d", z); }
+		}
 	}
 	if (g_sym.lua_pcall) {
-		int z = rblx_hook_install(&g_hook_pcall,
-		                          (void*)g_sym.lua_pcall,
-		                          (void*)detour_pc_entry, 16);
-		if (z == 0) g_hooks_active = true;
-		else { rc--; LOGE("pcall hook fail %d", z); }
+		if (g_mod_valid && !rblx_addr_in_module(&g_mod, (void*)g_sym.lua_pcall)) {
+			LOGE("pcall %p outside module — refusing to hook (poisoned symbol)",
+			     (void*)g_sym.lua_pcall);
+			g_sym.lua_pcall = nullptr;
+		} else {
+			int z = rblx_hook_install(&g_hook_pcall,
+			                          (void*)g_sym.lua_pcall,
+			                          (void*)detour_pc_entry, 16);
+			if (z == 0) g_hooks_active = true;
+			else { rc--; LOGE("pcall hook fail %d", z); }
+		}
 	}
 	LOGI("install_hooks rc=%d hooks_active=%d", rc, (int)g_hooks_active);
 	return rc;  // 0 == all good (or none present)
 }
 
-/* ---- symbol resolution (dlsym pass + fallback scan) ---- */
+/* ---- symbol resolution (in-memory ELF dynsym walk; NO dlopen) ---- */
 static int bind_symbols(const rblx_Module *mod) {
-	Dl_info dinfo{};
-	/* Prefer opening the already-loaded lib; RTLD_NOLOAD never forces a
-	 * duplicate load of the engine. Then promote the engine's symbols into
-	 * the global scope so the dlsym(RTLD_DEFAULT) fallback below can see
-	 * them even if Roblox loaded its libs non-globally.                  */
-	void *h = dlopen("libroblox.so", RTLD_NOLOAD | RTLD_NOW);  /* lowercase (current) */
-	if (!h) h = dlopen("libRoblox.so", RTLD_NOLOAD | RTLD_NOW);
-	if (!h) h = dlopen("libRobloxApp.so", RTLD_NOLOAD | RTLD_NOW);
-	if (!h) h = dlopen("libcustruntime.so", RTLD_NOLOAD | RTLD_NOW);
-	dlopen("libroblox.so", RTLD_NOW | RTLD_GLOBAL);
-	dlopen("libRoblox.so", RTLD_NOW | RTLD_GLOBAL);
-	dlopen("libRobloxApp.so", RTLD_NOW | RTLD_GLOBAL);
-	if (!h) h = RTLD_DEFAULT;
+	if (!mod || !mod->base) return -101;
 
+	/* Never dlopen the engine by name here: dlopen("libroblox.so", ...)
+	 * without RTLD_NOLOAD can LOAD A SECOND COPY of the 200MB+ engine into
+	 * the default namespace (the original lives in Roblox's private linker
+	 * namespace) → RAM spike → LMK kill seconds later. We resolve straight
+	 * from the already-mapped module instead.                            */
 	bool any = false;
 #define R(NAME) do {                                                       \
-		void *p = dlsym(h, #NAME);                                      \
-		*(void **)&g_sym.NAME = p;                                     \
-		if (p) any = true;                                            \
+		void *p = rblx_dlsym_module(mod, #NAME);                       \
+		if (p) { *(void **)&g_sym.NAME = p; any = true; }              \
 	} while (0)
 
-	(void)mod;
 	R(luaL_newstate);
 	R(lua_close);
 	R(luaL_openlibs);
@@ -190,6 +216,8 @@ static int bind_symbols(const rblx_Module *mod) {
 	R(lua_requiref);
 	R(lua_load);
 	R(lua_pushf_string);
+	R(lua_type);
+	R(lua_pushlstring);
 #undef R
 
 	/* alias fixup: some builds name loadstring differently */
@@ -199,19 +227,14 @@ static int bind_symbols(const rblx_Module *mod) {
 	}
 	if (g_sym.luaL_loadbufferx && !g_sym.luaL_loadbuffer)
 		g_sym.luaL_loadbuffer = (rblx_luaL_loadbuffer_t)g_sym.luaL_loadbufferx;
-	if (!g_sym.lua_pcall) {
-		/* scan module fallback — look up the lua_pcall opcode tail */
-		if (mod) {
-			uint8_t needle[] = {0x91,0x7C,0x20,0x34}; /* stub; real build uses */
-			uint8_t mask[]   = {'x','x','x','x'};       /*  configurable sigs      */
-			rblx_Pattern pat{needle, reinterpret_cast<const char*>(""), 0};
-			(void)pat;
-		}
-	}
-	LOGI("symbols: load=%p pcall=%p newstate=%p L=%p",
+
+	g_sym.module_base = mod->base;
+	g_sym.module_size = mod->size;
+
+	LOGI("symbols: load=%p pcall=%p newstate=%p type=%p",
 	     g_sym.luaL_loadstring, g_sym.lua_pcall, g_sym.luaL_newstate,
-	     (g_sym.lua_state_ptr ? *(void**)g_sym.lua_state_ptr : nullptr));
-	return any ? 0 : -1;
+	     g_sym.lua_type);
+	return any ? 0 : -102;
 }
 
 /*
@@ -222,23 +245,24 @@ static int bind_symbols(const rblx_Module *mod) {
  */
 static int resolve_lua_state(const rblx_Module *mod) {
 	if (!mod || !g_sym.luaL_loadstring) return -1;
+	if (!mod->bss_off) return -1;
 	void **scan = (void**)((uint8_t*)mod->base + mod->bss_off);
-	size_t ents = (mod->size - mod->bss_off) / sizeof(void*);
+	size_t ents = (mod->size > mod->bss_off)
+	              ? (mod->size - mod->bss_off) / sizeof(void*) : 0;
+	if (ents > (1u<<22)) ents = (1u<<22);          /* cap scan time */
 	uintptr_t lo = (uintptr_t)mod->base;
-	uintptr_t hi = (uintptr_t)mod->base + mod->size;
+	uintptr_t hi = (uintptr_t)mod->end;
 	for (size_t i = 0; i < ents; i++) {
 		void *cand = scan[i];
 		if (((uintptr_t)cand & 0x7) != 0) continue;
-		if ((uintptr_t)cand >= lo && (uintptr_t)cand < hi) {
-			/* plausibly a lua_State* or its internal pointer */
-			g_sym.lua_state_ptr = &scan[i];
-			g_sym.lua_state_ptr = &scan[i]; // store slot address
-			LOGI("found lua_State slot @ %p -> candidate %p",
-			     &scan[i], cand);
-			return 0;
-		}
+		if ((uintptr_t)cand < lo || (uintptr_t)cand >= hi) continue;
+		usleep(1000);
+		if (scan[i] != cand) continue;             /* unstable → skip */
+		g_sym.lua_state_ptr = &scan[i];            // store slot address
+		LOGI("found lua_State slot @ %p -> candidate %p", &scan[i], cand);
+		return 0;
 	}
-	LOGW("lua_State slot not auto-located; UNC will still run on demand");
+	LOGW("lua_State slot not auto-located; hooks deliver the live state");
 	return -1;
 }
 
@@ -255,7 +279,10 @@ static int do_inject_unc(void) {
 
 	rblx_lua_State *L = rblx_state_current();
 	if (!L) { LOGE("no live lua_State to inject UNC into"); return -1; }
-	if (g_sym.luaL_openlibs) g_sym.luaL_openlibs(L);
+	/* NOTE: we deliberately do NOT call luaL_openlibs(L) here. Re-opening the
+	 * standard libraries on Roblox's LIVE global state would replace their
+	 * customized globals and corrupt the running game. The state already has
+	 * everything it needs; we only add our own globals below.             */
 
 	int rc = rblx_unc_init(L, &env);
 	if (rc) LOGE("unc_init failed (%d)", rc);
@@ -263,6 +290,55 @@ static int do_inject_unc(void) {
 	if (rc) LOGE("memops init failed (%d)", rc);
 	g_hooks_active = true;
 	return rc;
+}
+
+/* ---- queued-script pump (runs ON the game's script thread) -------------- */
+static void pump_pending(rblx_lua_State *L) {
+	if (!L) return;
+
+	/* one-time UNC surface install — must happen on the game thread too */
+	if (!g_unc_injected) {
+		pthread_mutex_lock(&g_lock);
+		if (!g_unc_injected) {
+			if (do_inject_unc() == 0) g_unc_injected = true;
+		}
+		pthread_mutex_unlock(&g_lock);
+	}
+
+	pthread_mutex_lock(&g_queue_mu);
+	if (!g_pending_len) { pthread_mutex_unlock(&g_queue_mu); return; }
+	char src[RBLX_QUEUE_MAX];
+	size_t n = g_pending_len < RBLX_QUEUE_MAX - 1
+	           ? g_pending_len : RBLX_QUEUE_MAX - 1;
+	memcpy(src, g_pending, n);
+	src[n] = '\0';
+	g_pending_len = 0;                    /* dequeue */
+	pthread_mutex_unlock(&g_queue_mu);
+
+	/* Run through the ORIGINAL bodies (trampolines) to avoid re-entering
+	 * the detours while the game is already inside them. */
+	int rc = RBLX_LUA_ERRRUN;
+	ls_orig_t ls = reinterpret_cast<ls_orig_t>(rblx_trampoline_loadstring());
+	pc_orig_t pc = reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
+	if (ls && pc) {
+		int e = ls(L, src, "@executor-injected");
+		if (e == RBLX_LUA_OK) rc = pc(L, 0, 0, 0);
+		else rc = e;
+	} else if (g_sym.luaL_loadstring && g_sym.lua_pcall) {
+		int e = g_sym.luaL_loadstring(L, src, "@executor-injected");
+		if (e == RBLX_LUA_OK) rc = g_sym.lua_pcall(L, 0, 0, 0);
+		else rc = e;
+	}
+	if (rc != RBLX_LUA_OK && g_sym.lua_tostring) {
+		const char *msg = g_sym.lua_tostring(L, -1);
+		LOGW("exec err=%d: %s :: %.180s", rc, msg ? msg : "?", src);
+	}
+
+	pthread_mutex_lock(&g_queue_mu);
+	g_pending_rc = rc;
+	g_pending_done = true;
+	pthread_cond_broadcast(&g_queue_cv);
+	pthread_mutex_unlock(&g_queue_mu);
 }
 
 /* ---- JNI entry points ---- */
@@ -282,6 +358,8 @@ static int ensure_engine_locked(void) {
 		LOGE("Roblox native module unmapped (yet)");
 		return -100;
 	}
+	g_mod = mod;                          /* cache for symbol validation   */
+	g_mod_valid = true;
 	LOGI("Roblox module  base=%p end=%p size=%zu",
 	     mod.base, mod.end, mod.size);
 
@@ -293,7 +371,7 @@ static int ensure_engine_locked(void) {
 	}
 	if (!g_sym.lua_state_ptr) {
 		if (resolve_lua_state(&mod) != 0) {
-			// non-fatal; the live state can still be caught by the hooks
+			// non-fatal; the live state is delivered by the pcall detour
 			LOGW("lua_state resolution soft-failed");
 		}
 	}
@@ -308,52 +386,44 @@ static int jni_exec(JNIEnv *env, jobject thiz, jstring src) {
 	if (!src) return -1;
 	const char *cstr = env->GetStringUTFChars(src, nullptr);
 	if (!cstr) return -1;
+	size_t clen = strlen(cstr);
+	if (clen == 0 || clen >= RBLX_QUEUE_MAX - 1) {
+		env->ReleaseStringUTFChars(src, cstr);
+		return -4;                        /* script too large for the queue */
+	}
 
+	/* Lazy engine bring-up (bind + hooks). At Application.onCreate the
+	 * engine libs are usually not mapped yet, so retry now. Idempotent.   */
 	pthread_mutex_lock(&g_lock);
-
-	/* Lazy engine bring-up. At Application.onCreate the engine libs are
-	 * usually not mapped yet, so retry the whole binding now that we are
-	 * (presumably) inside a running game. Idempotent.                    */
 	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
 		ensure_engine_locked();
-
-	rblx_lua_State *L = rblx_state_current();
-	/* The detours set g_cur whenever Roblox itself runs lua_pcall; games
-	 * execute scripts continuously, so give a short window for one to
-	 * populate the live state before giving up.                          */
-	if (!L && g_hooks_active) {
-		for (int i = 0; i < 50 && !(L = rblx_state_current()); i++)
-			usleep(10 * 1000);                     /* 10ms x 50 = 500ms */
-	}
-	if (!L || !g_sym.luaL_loadstring || !g_sym.lua_pcall) {
-		LOGE("engine not ready or no live lua_State");
+	bool ready = g_sym.luaL_loadstring && g_sym.lua_pcall && g_hooks_active;
+	pthread_mutex_unlock(&g_lock);
+	if (!ready) {
+		LOGE("engine not ready (load=%p pcall=%p hooks=%d)",
+		     (void*)g_sym.luaL_loadstring, (void*)g_sym.lua_pcall,
+		     (int)g_hooks_active);
 		env->ReleaseStringUTFChars(src, cstr);
-		pthread_mutex_unlock(&g_lock);
 		return -2;
 	}
-	g_unc_depth++;
-	g_cur = L;
-	if (!g_unc_injected) {
-		do_inject_unc();              /* best-effort; binds to g_cur=L now */
-		g_unc_injected = true;
-	}
 
-	int e = g_sym.luaL_loadstring(L, cstr, "@executor-injected");
-	int rc = 0;
-	if (e == RBLX_LUA_OK)
-		rc = g_sym.lua_pcall(L, 0, 0 /*MULTI*/, 0);      /* LUA_MULTRET==0 */
-	else
-		rc = e;
-	if (rc != RBLX_LUA_OK) {
-		if (g_sym.lua_tostring) {
-			const char *msg = g_sym.lua_tostring(L, -1);
-			LOGW("exec err=%d: %s :: %.180s", rc,
-			     msg ? msg : "?",
-			     cstr);
-		}
+	/* Enqueue; the script runs on the game thread via the pcall detour. */
+	pthread_mutex_lock(&g_queue_mu);
+	memcpy(g_pending, cstr, clen + 1);
+	g_pending_len   = clen;
+	g_pending_done  = false;
+	g_pending_rc    = RBLX_LUA_ERRRUN;
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += 2;                        /* give the game thread up to 2s */
+	int rc = RBLX_LUA_ERRRUN;
+	while (!g_pending_done) {
+		int w = pthread_cond_timedwait(&g_queue_cv, &g_queue_mu, &ts);
+		if (g_pending_done) break;
+		if (w == ETIMEDOUT) break;
 	}
-	g_unc_depth--;
-	pthread_mutex_unlock(&g_lock);
+	rc = g_pending_done ? g_pending_rc : -2;
+	pthread_mutex_unlock(&g_queue_mu);
 	env->ReleaseStringUTFChars(src, cstr);
 
 	/* notify Java loader of frame completion so it can drain / gc tick */
@@ -401,10 +471,9 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 		fclose(f);
 		snprintf(found, sizeof(found), "mapped:[%s]", tmp);
 	}
+	/* PASSIVE report only — never triggers engine bring-up from here, so
+	 * tapping Diag can never crash the game.                            */
 	pthread_mutex_lock(&g_lock);
-	/* best-effort bring-up so the report reflects the post-init state */
-	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
-		ensure_engine_locked();
 	rblx_lua_State *L = rblx_state_current();
 	snprintf(buf, sizeof(buf),
 	         "%s\n"
@@ -417,6 +486,7 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "g_cur:%p\n"
 	         "hooks_active:%d\n"
 	         "unc_injected:%d\n"
+	         "queue:%s\n"
 	         "lua_alive:%s",
 	         found,
 	         (g_sym.luaL_loadstring || g_sym.lua_pcall) ? "bound" : "unbound",
@@ -424,6 +494,7 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         (void*)g_sym.lua_pcall, (void*)g_sym.luaL_newstate,
 	         (void*)g_sym.lua_state_ptr, (void*)g_cur,
 	         (int)g_hooks_active, (int)g_unc_injected,
+	         g_pending_len ? "busy" : "idle",
 	         L ? "yes" : "no");
 	pthread_mutex_unlock(&g_lock);
 	return env->NewStringUTF(buf);
@@ -443,12 +514,11 @@ JNIEXPORT jint JNICALL Java_roblox_executor_Executor_nativeInit(
 
 	/* At Application.onCreate the engine libs are usually NOT mapped yet
 	 * (that is why the old code died with -100 here). We tolerate that and
-	 * defer the real bring-up to jni_exec()'s lazy path (in-game).       */
+	 * defer the real bring-up to jni_exec()'s lazy path (in-game). The UNC
+	 * surface + user scripts are injected from the pcall detour, i.e. on
+	 * Roblox's own script thread — never from here (UI thread).          */
 	int rc = ensure_engine_locked();
-	if (rc == 0) {
-		do_inject_unc();              /* best-effort on the live state */
-		g_unc_injected = true;
-	} else if (rc == -100) {
+	if (rc == -100) {
 		rc = 0;                       /* engine will come up later */
 	}
 	pthread_mutex_unlock(&g_lock);
