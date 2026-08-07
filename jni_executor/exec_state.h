@@ -87,7 +87,7 @@ bool  rblx_in_trusted_loader(void);        /* true iff sUNC loader-frame armed*/
 #ifdef RBLX_NO_MACROS
 #else
 #define L_GETTOP()      (g_sym.lua_gettop          ? g_sym.lua_gettop(g_cur)          : 0)
-#define L_PUSHCC(fn,n)  (g_sym.lua_pushcclosure    ? g_sym.lua_pushcclosure(g_cur,fn,n)    : (void)0)
+#define L_PUSHCC(fn,n)  (g_sym.lua_pushcclosure    ? g_sym.lua_pushcclosure(g_cur,fn,nullptr,(n),nullptr) : (void)0)
 #define L_SETGLOBAL(k)  (g_sym.lua_setglobal       ? g_sym.lua_setglobal(g_cur,k)       : (void)0)
 #define L_PUSHNIL()     (g_sym.lua_pushnil         ? g_sym.lua_pushnil(g_cur)           : (void)0)
 #define L_PUSHS(s)      (g_sym.lua_pushstring      ? g_sym.lua_pushstring(g_cur,s)      : (void)0)

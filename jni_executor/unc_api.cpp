@@ -80,7 +80,7 @@ static void L_emit_fn(int(*fn)(rblx_lua_State*,void*,void*,int)){
 	void*cookie=(void*)0xDEADBEEFDEADBEEFULL;
 	if(g_sym.lua_pushlightuserdata) g_sym.lua_pushlightuserdata(g_cur,cookie);
 	if(g_sym.lua_pushcclosure) g_sym.lua_pushcclosure(g_cur,(rblx_lua_CFunction)fn,
-		g_sym.lua_pushlightuserdata?1:0);
+		nullptr, g_sym.lua_pushlightuserdata?1:0, nullptr);
 }
 static void bind_global(const char*g,const char*syn,int(*fn)(rblx_lua_State*,void*,void*,int)){
 	g_cur=rblx_state_current(); if(!g_cur||!fn) return;
@@ -269,7 +269,7 @@ void rblx_unc_bind_global(rblx_lua_State*L, const char*gname,
 	int base=L_top();
 	void*ck=(void*)0xDEADCAFEDEADCAFEULL;
 	if(g_sym.lua_pushlightuserdata) g_sym.lua_pushlightuserdata(g_cur,ck);
-	if(g_sym.lua_pushcclosure) g_sym.lua_pushcclosure(g_cur,fn,1);
+	if(g_sym.lua_pushcclosure) g_sym.lua_pushcclosure(g_cur,fn,nullptr,1,nullptr);
 	L_gset(gname);
 	L_popn(L_top()-base);
 	(void)synname;

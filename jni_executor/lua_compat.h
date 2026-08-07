@@ -65,9 +65,16 @@ typedef int                   (*rblx_luaL_loadbufferx_t)(rblx_lua_State *,
                                                          const char *, size_t,
                                                          const char *,
                                                          const char *);
+/* Roblox fork of pushcclosure carries EXTRA state vs stock Lua:
+ * (L, fn, const char* debugname, int nup, void* extra) — debugname and
+ * extra accept NULL. Confirmed by disasm @0x2229450: x2 goes through
+ * strlen (cbz NULL skip), w3 is the upvalue count, x4 is stored into
+ * the closure at +0x30.                                                  */
 typedef void                  (*rblx_lua_pushcclosure_t)(rblx_lua_State *,
                                                          rblx_lua_CFunction,
-                                                         int);
+                                                         const char *,
+                                                         int,
+                                                         void *);
 typedef int                   (*rblx_lua_pcall_t)(rblx_lua_State *,
                                                   int nargs, int nresults,
                                                   int errfunc);

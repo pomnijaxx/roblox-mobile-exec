@@ -140,7 +140,7 @@ static void reg_memfn(const char* gname, const char* syn, unc_fn f){
 	int b=top();
 	/* attach sUNC cookie as a single upvalue (provenance evidence) */
 	if(g_sym.lua_pushlightuserdata) g_sym.lua_pushlightuserdata(g_cur,(void*)0x000F1EA7DEADD065ULL);
-	if(g_sym.lua_pushcclosure)      g_sym.lua_pushcclosure(g_cur,(rblx_lua_CFunction)f,1);
+	if(g_sym.lua_pushcclosure)      g_sym.lua_pushcclosure(g_cur,(rblx_lua_CFunction)f,nullptr,1,nullptr);
 	if(g_sym.lua_setglobal)         g_sym.lua_setglobal(g_cur,gname);
 	if(syn && g_sym.lua_setglobal){ /* mirror into syn.* is handled in unc; keep simple */ }
 	popn(top()-b);

@@ -238,7 +238,7 @@ static int bind_symbols(const rblx_Module *mod) {
 	FB(lua_pcall,         0x5b4f2cc);   /* luaB_pcall → luaD_pcall          */
 	FB(lua_pushstring,    0x2229bf0);
 	FB(lua_pushlstring,   0x5b4d6c8);
-	FB(lua_pushcclosure,  0x2229450);   /* (L, fn, nup) — frame builder     */
+	FB(lua_pushcclosure,  0x2229450);   /* (L, fn, debugname, nup, ctx)     */
 	FB(lua_pushnil,       0x222a0dc);
 	FB(lua_gettop,        0x223ca6c);
 	FB(lua_settop,        0x2228e68);
@@ -361,7 +361,8 @@ static void pump_pending(rblx_lua_State *L) {
 	if (g_sym.luaB_loadstring && g_sym.lua_pushstring &&
 	    g_sym.lua_pushcclosure && pc) {
 		int top = g_sym.lua_gettop ? g_sym.lua_gettop(L) : 0;
-		g_sym.lua_pushcclosure(L, (rblx_lua_CFunction)g_sym.luaB_loadstring, 0);
+		g_sym.lua_pushcclosure(L, (rblx_lua_CFunction)g_sym.luaB_loadstring,
+		                      nullptr, 0, nullptr);
 		g_sym.lua_pushstring(L, src);
 		int n = pc(L, 1, 1, 0);      /* loadstring(src) → chunk | nil,err */
 		if (n == RBLX_LUA_OK) {
