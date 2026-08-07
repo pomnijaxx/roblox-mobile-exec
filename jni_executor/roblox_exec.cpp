@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -367,6 +368,34 @@ static int jni_alive(JNIEnv*, jobject) {
 	return S ? 0 : -1;
 }
 
+static jstring jni_diag(JNIEnv *env, jclass) {
+	char buf[1024];
+	pthread_mutex_lock(&g_lock);
+	/* best-effort bring-up so the report reflects the post-init state */
+	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
+		ensure_engine_locked();
+	rblx_lua_State *L = rblx_state_current();
+	snprintf(buf, sizeof(buf),
+	         "module:%s\n"
+	         "loadstring:%p\n"
+	         "loadbuffer:%p\n"
+	         "pcall:%p\n"
+	         "newstate:%p\n"
+	         "lua_state_ptr:%p\n"
+	         "g_cur:%p\n"
+	         "hooks_active:%d\n"
+	         "unc_injected:%d\n"
+	         "lua_alive:%s",
+	         (g_sym.luaL_loadstring || g_sym.lua_pcall) ? "bound" : "unbound",
+	         (void*)g_sym.luaL_loadstring, (void*)g_sym.luaL_loadbuffer,
+	         (void*)g_sym.lua_pcall, (void*)g_sym.luaL_newstate,
+	         (void*)g_sym.lua_state_ptr, (void*)g_cur,
+	         (int)g_hooks_active, (int)g_unc_injected,
+	         L ? "yes" : "no");
+	pthread_mutex_unlock(&g_lock);
+	return env->NewStringUTF(buf);
+}
+
 extern "C" {
 
 static int register_natives(JNIEnv *env);   /* defined below; JNI_OnLoad calls it */
@@ -424,6 +453,8 @@ static JNINativeMethod g_methods[] = {
 	  (void*)jni_exec },
 	{ (char*)"luaAliveQ",   (char*)"()I",
 	  (void*)jni_alive },
+	{ (char*)"nativeDiag",  (char*)"()Ljava/lang/String;",
+	  (void*)jni_diag },
 };
 
 static int register_natives(JNIEnv *env) {

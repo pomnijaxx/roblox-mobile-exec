@@ -31,6 +31,9 @@ public final class Executor {
     /** Execute a Lua chunk (UTF-8). Returns 0 on success, -1..-3 on error. */
     public static native int nativeExec(String source);
 
+    /** Engine diagnostic string: module/symbol/hook/state status. */
+    public static native String nativeDiag();
+
     /** Non-blocking liveness probe: 0 if a lua_State is live, -1 otherwise. */
     public static native int luaAliveQ();
 

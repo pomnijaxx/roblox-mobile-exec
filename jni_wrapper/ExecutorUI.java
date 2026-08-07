@@ -361,11 +361,21 @@ public final class ExecutorUI {
             public void onClick(View v) { hideOverlay(); }
         });
 
+        Button diag = new Button(app);
+        diag.setText("Diag");
+        diag.setTextColor(Color.WHITE);
+        diag.setBackgroundColor(0xFF3355AA);
+        diag.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { doDiag(); }
+        });
+
         row.addView(exec, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
         row.addView(clear, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
         row.addView(close, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
+        row.addView(diag, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f));
         root.addView(row);
 
@@ -397,9 +407,22 @@ public final class ExecutorUI {
         new Thread(new Runnable() {
             public void run() {
                 int rc = Executor.nativeExec(src);
-                appendLog("[exec] " + (rc == 0 ? "done (0)" : "error code " + rc));
+                if (rc == 0) {
+                    appendLog("[exec] done (0)");
+                } else {
+                    appendLog("[exec] error code " + rc);
+                    appendLog("[diag] " + Executor.nativeDiag());
+                }
             }
         }, "robloxexec-run").start();
+    }
+
+    private static void doDiag() {
+        new Thread(new Runnable() {
+            public void run() {
+                appendLog("[diag] " + Executor.nativeDiag());
+            }
+        }, "robloxexec-diag").start();
     }
 
     private static int dp(Context app, int value) {
