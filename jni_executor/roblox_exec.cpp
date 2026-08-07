@@ -32,6 +32,12 @@
 #include "memops.h"
 #include "exec_state.h"
 
+// DIAGNOSTIC BUILD FLAG — set to 1 to SKIP inline hook patching entirely.
+// Confirms whether the .text patch on lua_pcall is what triggers Roblox's
+// integrity/tamper check (2s smooth -> freeze -> ANR -> crash).
+#ifndef RBLX_DIAG_NOHOOKS
+#define RBLX_DIAG_NOHOOKS 1
+#endif
 #define LOG_TAG "RobloxExec"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
@@ -138,6 +144,10 @@ static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf)
 
 /* ---- inline-hook installer ---- */
 static int install_hooks(void) {
+#if RBLX_DIAG_NOHOOKS
+	LOGI("DIAGNOSTIC BUILD: hook patching SKIPPED by design (RBLX_DIAG_NOHOOKS=1)");
+	return 0;
+#endif
 	int rc = 0;
 	if (g_sym.luaL_loadstring) {
 		if (g_mod_valid && !rblx_addr_in_module(&g_mod, (void*)g_sym.luaL_loadstring)) {
