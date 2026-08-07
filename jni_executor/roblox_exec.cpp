@@ -256,6 +256,14 @@ static int bind_symbols(const rblx_Module *mod) {
 	if (g_sym.luaL_loadbufferx && !g_sym.luaL_loadbuffer)
 		g_sym.luaL_loadbuffer = (rblx_luaL_loadbuffer_t)g_sym.luaL_loadbufferx;
 
+	LOGI("bind: load=%p loadbuffer=%p ls_ro=%p pcall=%p tolstring=%p type=%p "
+	     "top=%p settop=%p cc=%p pushstr=%p",
+	     (void*)g_sym.luaL_loadstring, (void*)g_sym.luaL_loadbuffer,
+	     (void*)g_sym.luaB_loadstring, (void*)g_sym.lua_pcall,
+	     (void*)g_sym.lua_tolstring, (void*)g_sym.lua_type,
+	     (void*)g_sym.lua_gettop, (void*)g_sym.lua_settop,
+	     (void*)g_sym.lua_pushcclosure, (void*)g_sym.lua_pushstring);
+
 	g_sym.module_base = mod->base;
 	g_sym.module_size = mod->size;
 
@@ -426,26 +434,38 @@ static int ensure_engine_locked(void) {
 		LOGE("Roblox native module unmapped (yet)");
 		return -100;
 	}
+	LOGI("engine: module '%s' base=%p end=%p size=%zu",
+	     mod.name, mod.base, mod.end, mod.size);
 	g_mod = mod;                          /* cache for symbol validation   */
 	g_mod_valid = true;
-	LOGI("Roblox module  base=%p end=%p size=%zu",
-	     mod.base, mod.end, mod.size);
+	LOGI("engine: pre-bind load=%p ls_ro=%p pcall=%p",
+	     (void*)g_sym.luaL_loadstring, (void*)g_sym.luaB_loadstring,
+	     (void*)g_sym.lua_pcall);
 
 	if (!(g_sym.luaL_loadstring || g_sym.luaB_loadstring) || !g_sym.lua_pcall) {
-		if (bind_symbols(&mod) != 0) {
-			LOGE("symbol bind failed fatally");
+		int bs = bind_symbols(&mod);
+		LOGI("engine: bind_symbols rc=%d load=%p ls_ro=%p pcall=%p type=%p top=%p",
+		     bs, (void*)g_sym.luaL_loadstring, (void*)g_sym.luaB_loadstring,
+		     (void*)g_sym.lua_pcall, (void*)g_sym.lua_type,
+		     (void*)g_sym.lua_gettop);
+		if (bs != 0) {
+			LOGE("symbol bind failed fatally rc=%d", bs);
 			return -101;
 		}
 	}
 	if (!g_sym.lua_state_ptr) {
-		if (resolve_lua_state(&mod) != 0) {
-			// non-fatal; the live state is delivered by the pcall detour
-			LOGW("lua_state resolution soft-failed");
-		}
+		int rs = resolve_lua_state(&mod);
+		LOGW("engine: resolve_lua_state rc=%d state_ptr=%p", rs,
+		     (void*)g_sym.lua_state_ptr);
 	}
 	if (!g_hooks_active) {
-		install_hooks();
+		int ih = install_hooks();
+		LOGI("engine: install_hooks rc=%d hooks_active=%d", ih,
+		     (int)g_hooks_active);
 	}
+	LOGI("engine: ready load=%p ls_ro=%p pcall=%p hooks=%d",
+	     (void*)g_sym.luaL_loadstring, (void*)g_sym.luaB_loadstring,
+	     (void*)g_sym.lua_pcall, (int)g_hooks_active);
 	return 0;
 }
 
@@ -540,9 +560,15 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 		fclose(f);
 		snprintf(found, sizeof(found), "mapped:[%s]", tmp);
 	}
-	/* PASSIVE report only — never triggers engine bring-up from here, so
-	 * tapping Diag can never crash the game.                            */
+	/* ACTIVE diagnostic: attempt engine bring-up so a single in-game tap
+	 * binds + hooks and the report reflects the real post-bind state.
+	 * Idempotent and mutex-guarded, same path as Exec uses.           */
 	pthread_mutex_lock(&g_lock);
+	if (!(g_sym.luaL_loadstring || g_sym.luaB_loadstring) || !g_sym.lua_pcall ||
+	    !g_hooks_active) {
+		int brc = ensure_engine_locked();
+		LOGI("diag: bring-up rc=%d hooks_active=%d", brc, (int)g_hooks_active);
+	}
 	rblx_lua_State *L = rblx_state_current();
 	snprintf(buf, sizeof(buf),
 	         "%s\n"
