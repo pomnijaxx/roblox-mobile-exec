@@ -126,6 +126,12 @@ typedef const char *          (*rblx_lua_pushlstring_t)(rblx_lua_State *,
 #define RBLX_LUA_TK_FLOAT    0x00
 #define RBLX_LUA_TK_EOS        0xFF
 
+/* Standard Lua status codes (stock Lua 5.3 values) */
+#define RBLX_LUA_ERRRUN      2
+#define RBLX_LUA_ERRSYNTAX   3
+#define RBLX_LUA_ERRMEM      4
+#define RBLX_LUA_ERRERR      5
+
 #define RBLX_LUA_GLOBALS_ID    "globals"
 
 /* RBLX_API calling convention shim for callbacks */
