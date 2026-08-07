@@ -15,6 +15,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -140,9 +141,11 @@ static int bind_symbols(const rblx_Module *mod) {
 	 * duplicate load of the engine. Then promote the engine's symbols into
 	 * the global scope so the dlsym(RTLD_DEFAULT) fallback below can see
 	 * them even if Roblox loaded its libs non-globally.                  */
-	void *h = dlopen("libRoblox.so", RTLD_NOLOAD | RTLD_NOW);
+	void *h = dlopen("libroblox.so", RTLD_NOLOAD | RTLD_NOW);  /* lowercase (current) */
+	if (!h) h = dlopen("libRoblox.so", RTLD_NOLOAD | RTLD_NOW);
 	if (!h) h = dlopen("libRobloxApp.so", RTLD_NOLOAD | RTLD_NOW);
 	if (!h) h = dlopen("libcustruntime.so", RTLD_NOLOAD | RTLD_NOW);
+	dlopen("libroblox.so", RTLD_NOW | RTLD_GLOBAL);
 	dlopen("libRoblox.so", RTLD_NOW | RTLD_GLOBAL);
 	dlopen("libRobloxApp.so", RTLD_NOW | RTLD_GLOBAL);
 	if (!h) h = RTLD_DEFAULT;
@@ -269,7 +272,8 @@ static int do_inject_unc(void) {
 static int ensure_engine_locked(void) {
 	rblx_Module mod{};
 	bool have_module = false;
-	if (rblx_find_module("libRoblox.so", &mod) == 0 ||
+	if (rblx_find_module("libroblox.so", &mod) == 0 ||      /* lowercase (current) */
+	    rblx_find_module("libRoblox.so", &mod) == 0 ||      /* older builds */
 	    rblx_find_module("libRobloxApp.so", &mod) == 0 ||
 	    rblx_find_module("libcustruntime.so", &mod) == 0) {
 		have_module = true;
@@ -369,13 +373,41 @@ static int jni_alive(JNIEnv*, jobject) {
 }
 
 static jstring jni_diag(JNIEnv *env, jclass) {
-	char buf[1024];
+	char buf[2048];
+	char found[512] = "";
+	/* List candidate engine libs actually mapped in this process so a name
+	 * change never requires another logcat round-trip.                    */
+	FILE *f = fopen("/proc/self/maps", "r");
+	if (f) {
+		char line[512];
+		char tmp[512] = "";
+		while (fgets(line, sizeof(line) - 1, f)) {
+			const char *p = strstr(line, ".so");
+			if (!p) continue;
+			const char *s = p;
+			while (s > line && s[-1] != '/' && s[-1] != ' ') s--;
+			size_t n = (size_t)(p - s) + 3;
+			if (n > 127) continue;
+			if (strncasecmp(s, "libroblox", 9) != 0 &&
+			    strncasecmp(s, "libcustruntime", 14) != 0)
+				continue;
+			char nm[128];
+			memcpy(nm, s, n); nm[n] = '\0';
+			if (!strstr(tmp, nm)) {
+				strncat(tmp, nm, sizeof(tmp) - strlen(tmp) - 1);
+				strncat(tmp, " ", sizeof(tmp) - strlen(tmp) - 1);
+			}
+		}
+		fclose(f);
+		snprintf(found, sizeof(found), "mapped:[%s]", tmp);
+	}
 	pthread_mutex_lock(&g_lock);
 	/* best-effort bring-up so the report reflects the post-init state */
 	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
 		ensure_engine_locked();
 	rblx_lua_State *L = rblx_state_current();
 	snprintf(buf, sizeof(buf),
+	         "%s\n"
 	         "module:%s\n"
 	         "loadstring:%p\n"
 	         "loadbuffer:%p\n"
@@ -386,6 +418,7 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "hooks_active:%d\n"
 	         "unc_injected:%d\n"
 	         "lua_alive:%s",
+	         found,
 	         (g_sym.luaL_loadstring || g_sym.lua_pcall) ? "bound" : "unbound",
 	         (void*)g_sym.luaL_loadstring, (void*)g_sym.luaL_loadbuffer,
 	         (void*)g_sym.lua_pcall, (void*)g_sym.luaL_newstate,
