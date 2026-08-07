@@ -63,7 +63,7 @@ jobs:
             set -euo pipefail
             PKG="com.roblox.client"
             SLUG="roblox"
-            pip install -q curl_cffi
+            pip install -q typing_extensions curl_cffi
             python3 - "$PKG" "$SLUG" <<'EOF'
             import re, sys, os
             from curl_cffi import requests

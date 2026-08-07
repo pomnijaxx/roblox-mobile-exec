@@ -90,7 +90,7 @@ jobs:
           PKG="${{ inputs.apk_pkg }}"
           SLUG="${{ inputs.apk_slug }}"
           echo "package=$PKG slug=$SLUG"
-          pip install -q curl_cffi
+          pip install -q typing_extensions curl_cffi
           python3 - "$PKG" "$SLUG" <<'EOF'
           import re, sys, os
           from curl_cffi import requests
