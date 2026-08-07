@@ -364,9 +364,20 @@ static void pump_pending(rblx_lua_State *L) {
 		g_sym.lua_pushcclosure(L, (rblx_lua_CFunction)g_sym.luaB_loadstring,
 		                      nullptr, 0, nullptr);
 		g_sym.lua_pushstring(L, src);
-		int n = pc(L, 1, 1, 0);      /* loadstring(src) → chunk | nil,err */
+		int n = pc(L, 1, 1, 0);      /* loadstring(src) → chunk | nil */
 		if (n == RBLX_LUA_OK) {
-			rc = pc(L, 0, 0, 0);     /* run the chunk (net stack balance) */
+			/* engine loadstring contract: 1 result = chunk (function) on
+			 * top, or nil on compile failure. Check the type — calling
+			 * nil blindly yields "attempt to call a nil value" instead
+			 * of a contained syntax error. Validated in harness.       */
+			int t = g_sym.lua_type ? g_sym.lua_type(L, -1)
+			                       : RBLX_LUA_TFUNCTION;
+			if (t == RBLX_LUA_TFUNCTION) {
+				rc = pc(L, 0, 0, 0); /* run the chunk (net stack balance) */
+			} else {
+				rc = RBLX_LUA_ERRSYNTAX;
+				if (g_sym.lua_settop) g_sym.lua_settop(L, top);
+			}
 		} else {
 			rc = (n == RBLX_LUA_ERRMEM) ? n : RBLX_LUA_ERRSYNTAX;
 			if (g_sym.lua_settop) g_sym.lua_settop(L, top);  /* drop err */
