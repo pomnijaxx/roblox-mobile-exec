@@ -238,6 +238,7 @@ static int bind_symbols(const rblx_Module *mod) {
 	FB(lua_pcall,         0x5b4f2cc);   /* luaB_pcall → luaD_pcall          */
 	FB(lua_pushstring,    0x2229bf0);
 	FB(lua_pushlstring,   0x5b4d6c8);
+	FB(lua_pushcclosure,  0x2229450);   /* (L, fn, nup) — frame builder     */
 	FB(lua_pushnil,       0x222a0dc);
 	FB(lua_gettop,        0x223ca6c);
 	FB(lua_settop,        0x2228e68);
@@ -348,21 +349,26 @@ static void pump_pending(rblx_lua_State *L) {
 	int rc = RBLX_LUA_ERRRUN;
 	ls_orig_t ls = reinterpret_cast<ls_orig_t>(rblx_trampoline_loadstring());
 	pc_orig_t pc = reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
-	/* Preferred path: the engine's OWN global `loadstring` closure
-	 * (luaB_loadstring, int(lua_State*)). Push source → call closure
-	 * (1: chunk on top | 2: nil, err on top) → run the chunk through the
-	 * ORIGINAL lua_pcall trampoline so we never re-enter detour_pc_entry. */
-	if (g_sym.luaB_loadstring && g_sym.lua_pushstring && pc) {
+	/* Preferred path: the engine's OWN `loadstring` C function, wrapped in a
+	 * FRESH C closure and driven through lua_pcall. Calling the raw engine
+	 * function directly with the game's stack was WRONG: loadstring reads
+	 * ARG 1 of the current frame, which inside the game's in-flight
+	 * lua_pcall is the GAME's function, not our pushed string — the type
+	 * check failed, luaL_error did a longjmp through our detour frames and
+	 * corrupted the live state (crash seconds later). Driving it through
+	 * lua_pcall makes the VM build a correct frame (arg1 = src) and
+	 * captures compile/runtime errors cleanly (status return, no longjmp). */
+	if (g_sym.luaB_loadstring && g_sym.lua_pushstring &&
+	    g_sym.lua_pushcclosure && pc) {
 		int top = g_sym.lua_gettop ? g_sym.lua_gettop(L) : 0;
+		g_sym.lua_pushcclosure(L, (rblx_lua_CFunction)g_sym.luaB_loadstring, 0);
 		g_sym.lua_pushstring(L, src);
-		int n = g_sym.luaB_loadstring(L);
-		if (n == 1) {
-			rc = pc(L, 0, 0, 0);          /* err msg (if any) on top */
-		} else if (n == 2) {
-			rc = RBLX_LUA_ERRSYNTAX;      /* nil, err on top */
+		int n = pc(L, 1, 1, 0);      /* loadstring(src) → chunk | nil,err */
+		if (n == RBLX_LUA_OK) {
+			rc = pc(L, 0, 0, 0);     /* run the chunk (net stack balance) */
 		} else {
-			rc = RBLX_LUA_ERRRUN;         /* engine refused the chunk */
-			if (g_sym.lua_settop) g_sym.lua_settop(L, top);  /* undo push */
+			rc = (n == RBLX_LUA_ERRMEM) ? n : RBLX_LUA_ERRSYNTAX;
+			if (g_sym.lua_settop) g_sym.lua_settop(L, top);  /* drop err */
 		}
 	} else if (ls && pc) {
 		int e = ls(L, src, "@executor-injected");
