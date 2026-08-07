@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #include "lua_compat.h"
 #include "scan.h"
@@ -39,6 +40,7 @@ rblx_lua_State *g_cur           = nullptr;
 static JavaVM *g_jvm            = nullptr;
 static jobject  g_loader_cb      = nullptr;     /* global ref on ScriptLoader   */
 static bool      g_hooks_active  = false;
+static bool      g_unc_injected  = false;       /* UNC family injected at least once */
 static pthread_mutex_t g_lock    = PTHREAD_MUTEX_INITIALIZER;
 
 /* Native-side JNI handles reached by the UNC/HTTP surface in adjacent TUs.
@@ -133,9 +135,15 @@ static int install_hooks(void) {
 /* ---- symbol resolution (dlsym pass + fallback scan) ---- */
 static int bind_symbols(const rblx_Module *mod) {
 	Dl_info dinfo{};
-	/* Prefer opening the already-loaded lib (RLD_DEFAULT fallback).        */
-	void *h = dlopen("liblibRoblox.so", RTLD_NOLOAD | RTLD_NOW);
-	if (!h) h = dlopen("libcustruntime.so", RTLD_NOW);   /* alt build */
+	/* Prefer opening the already-loaded lib; RTLD_NOLOAD never forces a
+	 * duplicate load of the engine. Then promote the engine's symbols into
+	 * the global scope so the dlsym(RTLD_DEFAULT) fallback below can see
+	 * them even if Roblox loaded its libs non-globally.                  */
+	void *h = dlopen("libRoblox.so", RTLD_NOLOAD | RTLD_NOW);
+	if (!h) h = dlopen("libRobloxApp.so", RTLD_NOLOAD | RTLD_NOW);
+	if (!h) h = dlopen("libcustruntime.so", RTLD_NOLOAD | RTLD_NOW);
+	dlopen("libRoblox.so", RTLD_NOW | RTLD_GLOBAL);
+	dlopen("libRobloxApp.so", RTLD_NOW | RTLD_GLOBAL);
 	if (!h) h = RTLD_DEFAULT;
 
 	bool any = false;
@@ -254,21 +262,77 @@ static int do_inject_unc(void) {
 }
 
 /* ---- JNI entry points ---- */
+
+/* Idempotent engine bring-up. Safe to call many times; only the steps that
+ * are still missing actually run. Must be called with g_lock held.        */
+static int ensure_engine_locked(void) {
+	rblx_Module mod{};
+	bool have_module = false;
+	if (rblx_find_module("libRoblox.so", &mod) == 0 ||
+	    rblx_find_module("libRobloxApp.so", &mod) == 0 ||
+	    rblx_find_module("libcustruntime.so", &mod) == 0) {
+		have_module = true;
+	}
+	if (!have_module) {
+		LOGE("Roblox native module unmapped (yet)");
+		return -100;
+	}
+	LOGI("Roblox module  base=%p end=%p size=%zu",
+	     mod.base, mod.end, mod.size);
+
+	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall) {
+		if (bind_symbols(&mod) != 0) {
+			LOGE("symbol bind failed fatally");
+			return -101;
+		}
+	}
+	if (!g_sym.lua_state_ptr) {
+		if (resolve_lua_state(&mod) != 0) {
+			// non-fatal; the live state can still be caught by the hooks
+			LOGW("lua_state resolution soft-failed");
+		}
+	}
+	if (!g_hooks_active) {
+		install_hooks();
+	}
+	return 0;
+}
+
 static int jni_exec(JNIEnv *env, jobject thiz, jstring src) {
 	(void)thiz;
 	if (!src) return -1;
 	const char *cstr = env->GetStringUTFChars(src, nullptr);
 	if (!cstr) return -1;
+
+	pthread_mutex_lock(&g_lock);
+
+	/* Lazy engine bring-up. At Application.onCreate the engine libs are
+	 * usually not mapped yet, so retry the whole binding now that we are
+	 * (presumably) inside a running game. Idempotent.                    */
+	if (!g_sym.luaL_loadstring || !g_sym.lua_pcall)
+		ensure_engine_locked();
+
 	rblx_lua_State *L = rblx_state_current();
+	/* The detours set g_cur whenever Roblox itself runs lua_pcall; games
+	 * execute scripts continuously, so give a short window for one to
+	 * populate the live state before giving up.                          */
+	if (!L && g_hooks_active) {
+		for (int i = 0; i < 50 && !(L = rblx_state_current()); i++)
+			usleep(10 * 1000);                     /* 10ms x 50 = 500ms */
+	}
 	if (!L || !g_sym.luaL_loadstring || !g_sym.lua_pcall) {
 		LOGE("engine not ready or no live lua_State");
 		env->ReleaseStringUTFChars(src, cstr);
+		pthread_mutex_unlock(&g_lock);
 		return -2;
 	}
-
-	pthread_mutex_lock(&g_lock);
 	g_unc_depth++;
 	g_cur = L;
+	if (!g_unc_injected) {
+		do_inject_unc();              /* best-effort; binds to g_cur=L now */
+		g_unc_injected = true;
+	}
+
 	int e = g_sym.luaL_loadstring(L, cstr, "@executor-injected");
 	int rc = 0;
 	if (e == RBLX_LUA_OK)
@@ -315,34 +379,18 @@ JNIEXPORT jint JNICALL Java_roblox_executor_Executor_nativeInit(
 
 	pthread_mutex_lock(&g_lock);
 
-	rblx_Module mod{};
-	if (rblx_find_module("libRoblox.so", &mod) != 0 &&
-	    rblx_find_module("libRobloxApp.so", &mod) != 0 &&
-	    rblx_find_module("libcustruntime.so", &mod) != 0) {
-		LOGE("Roblox native module unmapped — running in wrong process");
-		pthread_mutex_unlock(&g_lock);
-		return -100;
+	/* At Application.onCreate the engine libs are usually NOT mapped yet
+	 * (that is why the old code died with -100 here). We tolerate that and
+	 * defer the real bring-up to jni_exec()'s lazy path (in-game).       */
+	int rc = ensure_engine_locked();
+	if (rc == 0) {
+		do_inject_unc();              /* best-effort on the live state */
+		g_unc_injected = true;
+	} else if (rc == -100) {
+		rc = 0;                       /* engine will come up later */
 	}
-	LOGI("Roblox module  base=%p end=%p size=%zu",
-	     mod.base, mod.end, mod.size);
-
-	if (bind_symbols(&mod) != 0) {
-		LOGE("symbol bind failed fatally");
-		pthread_mutex_unlock(&g_lock);
-		return -101;
-	}
-	if (resolve_lua_state(&mod) != 0) {
-		// non-fatal; we can still use newly opened states, just UNC won't bind
-		LOGW("lua_state resolution soft-failed");
-	}
-
-	/* Step: install inline hooks (sUNC gate + trace). Tolerant of failure. */
-	install_hooks();
-
-	/* Step: inject UNC + memops on the live lua_State */
-	int rc = do_inject_unc();
 	pthread_mutex_unlock(&g_lock);
-	return (rc == 0 || rc == -1) ? 0 : rc;  /* -1 acceptable: UNC still works */
+	return rc;
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
