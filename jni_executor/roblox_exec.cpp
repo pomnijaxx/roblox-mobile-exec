@@ -333,7 +333,16 @@ static int do_inject_unc(void) {
 static void pump_pending(rblx_lua_State *L) {
 	if (!L) return;
 
-	/* one-time UNC surface install — must happen on the game thread too */
+	/* FAST PATH FIRST: with an idle queue the detour must do ZERO work —
+	 * no UNC injection, no state probing. The previous order ran
+	 * do_inject_unc() on the very first pcall after hook install (even
+	 * with no script queued), re-entrantly mutating the game's live Lua
+	 * state inside its own in-flight pcall → freeze then crash.          */
+	pthread_mutex_lock(&g_queue_mu);
+	if (!g_pending_len) { pthread_mutex_unlock(&g_queue_mu); return; }
+	pthread_mutex_unlock(&g_queue_mu);
+
+	/* one-time UNC surface install — only reached when a script is pending */
 	if (!g_unc_injected) {
 		pthread_mutex_lock(&g_lock);
 		if (!g_unc_injected) {
