@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <time.h>
 #include <dirent.h>
+#include <stdarg.h>
 
 #include "lua_compat.h"
 #include "scan.h"
@@ -47,6 +48,113 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__)
+
+/* ---- continuous tamper-scanner capture (RBLX_SCANLOG) -----------------
+ * A background thread snapshots EVERY thread's cpu ticks every 250ms and
+ * appends one line to /sdcard/Download/tscan_log.txt. When the game's
+ * anti-tamper freezes us ~2s after .text patching, the tail of this file
+ * shows WHICH thread spiked (and whether a new thread appeared) right
+ * before the freeze — that's the scanner, caught in the act.
+ * Enabled by default; harmless on no-hook builds (no freeze, log idle). */
+#ifndef RBLX_SCANLOG
+#define RBLX_SCANLOG 1
+#endif
+#define RBLX_TSLOG_PATH "/storage/emulated/0/Download/tscan_log.txt"
+/* Fallback copies: app-internal path (no storage permission needed to WRITE,
+ * but needs run-as/adb to read) and a path guessed from our own package. */
+static const char *tslog_internal_path(void) {
+	static char buf[160];
+	static int  done = 0;
+	if (!done) {
+		done = 1;
+		char pkg[96] = "com.roblox.client";
+		FILE *f = fopen("/proc/self/cmdline", "r");
+		if (f) {
+			size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+			fclose(f);
+			if (n) pkg[n] = '\0';   /* cmdline is NUL-terminated */
+		}
+		char *slash = strchr(pkg, '/');
+		if (slash) *slash = '\0';
+		/* 1) app-private: needs adb root/unroot to read */
+		snprintf(buf, sizeof(buf), "/data/data/%s/files/tscan_log.txt", pkg);
+	}
+	return buf;
+}
+
+/* Path every app can write on Android 11+ WITHOUT storage permission, and
+ * one the Termux shell can read directly: Android/data/<pkg>/files/.        */
+static const char *tslog_android_data_path(void) {
+	static char buf[192];
+	static int  done = 0;
+	if (!done) {
+		done = 1;
+		char pkg[96] = "com.roblox.client";
+		FILE *f = fopen("/proc/self/cmdline", "r");
+		if (f) {
+			size_t n = fread(pkg, 1, sizeof(pkg) - 1, f);
+			fclose(f);
+			if (n) pkg[n] = '\0';
+		}
+		char *slash = strchr(pkg, '/');
+		if (slash) *slash = '\0';
+		snprintf(buf, sizeof(buf),
+		         "/storage/emulated/0/Android/data/%s/files/tscan_log.txt",
+		         pkg);
+	}
+	return buf;
+}
+#define RBLX_TS_INTERVAL_MS  250
+#define RBLX_TS_MAX_THREADS  512
+#define RBLX_SPIKE_TICKS 20 /* ~80% of one core per 250ms window (100Hz ticks) */
+
+static pthread_mutex_t g_tslog_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile long g_pcall_calls = 0;   /* counted in detour_pc_entry */
+
+static void tslog(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	char line[1024];
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	int h = snprintf(line, sizeof(line), "[%ld.%03ld] ",
+	                 (long)ts.tv_sec, ts.tv_nsec / 1000000);
+	vsnprintf(line + h, sizeof(line) - (size_t)h, fmt, ap);
+	va_end(ap);
+	__android_log_print(ANDROID_LOG_INFO, "RobloxTScan", "%s", line);
+	pthread_mutex_lock(&g_tslog_mu);
+	/* 1) external: /storage/emulated/0/Download (readable by Termux) */
+	FILE *f = fopen(RBLX_TSLOG_PATH, "a");
+	if (f) {
+		fputs(line, f);
+		fputc('\n', f);
+		fflush(f);
+		fclose(f);
+	}
+	/* 1b) Android/data/<pkg>/files — writeable w/o permission, readable by Termux */
+	const char *jd = tslog_android_data_path();
+	if (jd) {
+		FILE *h = fopen(jd, "a");
+		if (h) {
+			fputs(line, h);
+			fputc('\n', h);
+			fflush(h);
+			fclose(h);
+		}
+	}
+	/* 3) internal: app-private files dir (readable via adb run-as) */
+	const char *ip = tslog_internal_path();
+	if (ip) {
+		FILE *g = fopen(ip, "a");
+		if (g) {
+			fputs(line, g);
+			fputc('\n', g);
+			fflush(g);
+			fclose(g);
+		}
+	}
+	pthread_mutex_unlock(&g_tslog_mu);
+}
 
 /* Definitions of externs declared in exec_state.h */
 RobloxSymbols  g_sym{};
@@ -139,6 +247,7 @@ static int detour_ls_entry(rblx_lua_State *L, const char* src, const char* name)
 	return tramp ? tramp(L, src, name) : 0;   // propagate original status
 }
 static int detour_pc_entry(rblx_lua_State *L, int nargs, int nresults, int errf){	g_cur=L;
+	__sync_add_and_fetch(&g_pcall_calls, 1);
 	pump_pending(L);                     // run queued user script on the game thread
 	g_unc_depth++;                      // block re-entrant UNC dispatch
 	pc_orig_t tramp=reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
@@ -160,6 +269,7 @@ static int install_hooks(void) {
 	int rc = 0;
 #if RBLX_HOOK_MODE == 1
 	LOGI("DIAGNOSTIC BUILD: hook patching SKIPPED by design (RBLX_HOOK_MODE=1)");
+	tslog("HOOKS SKIPPED mode=1");
 	return 0;
 #elif RBLX_HOOK_MODE == 2
 	LOGI("PROBE BUILD: hooking lua_tolstring ONLY (RBLX_HOOK_MODE=2)");
@@ -172,11 +282,12 @@ static int install_hooks(void) {
 			int z = rblx_hook_install(&g_hook_tolstring,
 			                          (void*)g_sym.lua_tolstring,
 			                          (void*)detour_ts_entry, 16);
-			if (z == 0) g_hooks_active = true;
+			if (z == 0) { g_hooks_active = true; tslog("HOOKS tolstring installed"); }
 			else { rc--; LOGE("tolstring hook fail %d", z); }
 		}
 	}
 	LOGI("install_hooks(PROBE tolstring) rc=%d hooks_active=%d", rc, (int)g_hooks_active);
+	tslog("HOOKS done mode=2 rc=%d active=%d", rc, (int)g_hooks_active);
 	return rc;  // 0 == all good (or none present)
 #else
 	LOGI("NORMAL BUILD: hooking loadstring + pcall (RBLX_HOOK_MODE=0)");
@@ -189,7 +300,7 @@ static int install_hooks(void) {
 			int z = rblx_hook_install(&g_hook_loadstring,
 			                          (void*)g_sym.luaL_loadstring,
 			                          (void*)detour_ls_entry, 16);
-			if (z == 0) g_hooks_active = true;
+			if (z == 0) { g_hooks_active = true; tslog("HOOKS loadstring installed"); }
 			else { rc--; LOGE("loadstring hook fail %d", z); }
 		}
 	}
@@ -202,11 +313,12 @@ static int install_hooks(void) {
 			int z = rblx_hook_install(&g_hook_pcall,
 			                          (void*)g_sym.lua_pcall,
 			                          (void*)detour_pc_entry, 16);
-			if (z == 0) g_hooks_active = true;
+			if (z == 0) { g_hooks_active = true; tslog("HOOKS pcall installed"); }
 			else { rc--; LOGE("pcall hook fail %d", z); }
 		}
 	}
 	LOGI("install_hooks rc=%d hooks_active=%d", rc, (int)g_hooks_active);
+	tslog("HOOKS done mode=0 rc=%d active=%d", rc, (int)g_hooks_active);
 	return rc;  // 0 == all good (or none present)
 #endif
 }
@@ -582,11 +694,103 @@ static int jni_alive(JNIEnv*, jobject) {
 	return S ? 0 : -1;
 }
 
-/* ---- thread CPU sampler: find the tamper scanner by behavior -----------
- * The scanner wakes periodically to verify .text. We sample every thread's
- * utime+stime over ~2.5s and report which threads burn CPU. The tamper
- * thread shows a distinctive periodic pattern (quiet, then a burst).
+/* ---- continuous thread CPU sampler (tamper scanner hunter) ---------------
+ * A dedicated thread wakes every RBLX_TS_INTERVAL_MS, snapshots ALL
+ * /proc/self/task/*/stat cpu ticks, and appends one line to the log
+ * describing new threads, the biggest cpu burner, and any spikes
+ * (delta >= ~80% of the window). It also logs the pcall call count as
+ * activity proxy (Roblox drives Lua through our detour). This produces
+ * a time series right up to the freeze — showing WHICH thread is the
+ * periodic .text-validator that freezes us.
  */
+struct ts_thread_t { long tid; char comm[32]; long cpu; };
+
+static int ts_read_one(long tid, struct ts_thread_t *o) {
+	char p[64], line[800];
+	snprintf(p, sizeof(p), "/proc/self/task/%ld/stat", tid);
+	FILE *f = fopen(p, "r");
+	if (!f) return -1;
+	if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+	fclose(f);
+	char cm[32] = ""; long u = 0, s = 0;
+	if (sscanf(line, "%*d (%31[^)]) %*c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %ld %ld",
+	           cm, &u, &s) < 2) return -1;
+	o->tid = tid;
+	strncpy(o->comm, cm, sizeof(o->comm) - 1);
+	o->comm[sizeof(o->comm) - 1] = '\0';
+	o->cpu = u + s;
+	return 0;
+}
+
+static int ts_snapshot(struct ts_thread_t *T, int maxn) {
+	DIR *d = opendir("/proc/self/task");
+	if (!d) return 0;
+	int n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) && n < maxn) {
+		if (e->d_name[0] == '.') continue;
+		long tid = atol(e->d_name);
+		if (tid <= 0) continue;
+		if (ts_read_one(tid, &T[n]) == 0) n++;
+	}
+	closedir(d);
+	return n;
+}
+
+static void *ts_sampler_thread(void *unused) {
+	(void)unused;
+	tslog("RSCAN started");
+	enum { MAXT = RBLX_TS_MAX_THREADS };
+	struct ts_thread_t A[MAXT], B[MAXT];
+	int na = ts_snapshot(A, MAXT);
+	for (;;) {
+		usleep(RBLX_TS_INTERVAL_MS * 1000);
+		int nb = ts_snapshot(B, MAXT);
+		long calls = g_pcall_calls;
+
+		/* 1) NEW threads (not present in previous snapshot) */
+		char news[256] = "";
+		for (int i = 0; i < nb; i++) {
+			bool inA = false;
+			for (int j = 0; j < na; j++)
+				if (B[i].tid == A[j].tid) { inA = true; break; }
+			if (!inA) {
+				char part[128];
+				snprintf(part, sizeof(part), "%s(%ld) ", B[i].comm, B[i].tid);
+				strncat(news, part, sizeof(news) - strlen(news) - 1);
+			}
+		}
+
+		/* 2) deltas + biggest burner + spikes */
+		long tot = 0, bestdt = 0, spk_sum = 0;
+		int  spk = 0, best_i = -1;
+		for (int i = 0; i < nb; i++) {
+			long dt = B[i].cpu;
+			for (int j = 0; j < na; j++)
+				if (B[i].tid == A[j].tid) { dt -= A[j].cpu; break; }
+			tot += dt;
+			if (dt > bestdt) { bestdt = dt; best_i = i; }
+			if (dt >= RBLX_SPIKE_TICKS) { spk++; spk_sum += dt; }
+		}
+		char line[700];
+		int l = snprintf(line, sizeof(line),
+		                 "n=%d pcall=%ld d=%ld", nb, calls, tot);
+		if (news[0])
+			l += snprintf(line + l, sizeof(line) - l, " NEW(%s)", news);
+		if (best_i >= 0 && bestdt > 0)
+			l += snprintf(line + l, sizeof(line) - l, " burn=%s(%ld)=%ld",
+			              B[best_i].comm, B[best_i].tid, bestdt);
+		if (spk)
+			l += snprintf(line + l, sizeof(line) - l, " SPIKEx%d=%ld",
+			              spk, spk_sum);
+		tslog("%s", line);
+
+		/* 3) rotate */
+		memcpy(A, B, sizeof(A[0]) * (size_t)nb);
+		na = nb;
+	}
+	return nullptr;
+}
 #define RBLX_TSCAN_MAX_THREADS 256
 struct tscan_t { long tid; char comm[32]; long cpu0; long cpu1; long dt; };
 
@@ -760,6 +964,14 @@ JNIEXPORT jint JNICALL Java_roblox_executor_Executor_nativeInit(
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
 	LOGI("librobloxexec.so loaded (vm=%p)", (void*)vm);
 	g_jvm = vm;
+#if RBLX_SCANLOG
+	/* start the continuous thread CPU sampler — survives across screen
+	 * changes and writes tscan_log.txt until the process exits, so a
+	 * tamper-triggered freeze leaves its last samples on disk. */
+	pthread_t st;
+	if (pthread_create(&st, nullptr, ts_sampler_thread, nullptr) == 0)
+		pthread_detach(st);
+#endif
 	JNIEnv *env = nullptr;
 	if (vm) if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) return -1;
 	register_natives(env);  /* best-effort */
