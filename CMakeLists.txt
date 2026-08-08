@@ -8,6 +8,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Build-mode switches. Defaults: normal hooks ON (executor), scanlog ON.
+# Pass -DRBLX_HOOK_MODE=1 (no hooks) or =2 (tolstring probe) on the cmake
+# command line to change behavior; these become real #defines below.
+if(NOT DEFINED RBLX_HOOK_MODE)
+  set(RBLX_HOOK_MODE 0)
+endif()
+if(NOT DEFINED RBLX_SCANLOG)
+  set(RBLX_SCANLOG 1)
+endif()
+
 add_library(robloxexec SHARED
   jni_executor/scan.cpp
   jni_executor/hooks.cpp
@@ -22,6 +32,8 @@ target_include_directories(robloxexec PRIVATE
 
 target_compile_definitions(robloxexec PRIVATE
   __ANDROID__           # forces jni.h / android/log.h branches
+  RBLX_HOOK_MODE=${RBLX_HOOK_MODE}
+  RBLX_SCANLOG=${RBLX_SCANLOG}
 )
 
 target_compile_options(robloxexec PRIVATE
