@@ -638,6 +638,8 @@ static int jni_exec(JNIEnv *env, jobject thiz, jstring src) {
 	const char *cstr = env->GetStringUTFChars(src, nullptr);
 	if (!cstr) return -1;
 	size_t clen = strlen(cstr);
+	LOGI("jni_exec: clen=%zu first64=[%.*s]", clen,
+	     (int)(clen < 64 ? clen : 64), cstr);
 	if (clen == 0 || clen >= RBLX_QUEUE_MAX - 1) {
 		env->ReleaseStringUTFChars(src, cstr);
 		return -4;                        /* script too large for the queue */

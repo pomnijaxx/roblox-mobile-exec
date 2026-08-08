@@ -420,6 +420,16 @@ public final class ExecutorUI {
     private static void doDiag() {
         new Thread(new Runnable() {
             public void run() {
+                String field = (sScript != null) ? sScript.getText().toString() : null;
+                if (field != null && !field.isEmpty()) {
+                    String preview = field.length() > 60
+                            ? field.substring(0, 60) : field;
+                    preview = preview.replace("\n", "\\n");
+                    appendLog("[field] len=" + field.length()
+                            + " head=[" + preview + "]");
+                } else {
+                    appendLog("[field] (vazio)");
+                }
                 appendLog("[diag] " + Executor.nativeDiag());
             }
         }, "robloxexec-diag").start();
