@@ -695,13 +695,13 @@ static int jni_alive(JNIEnv*, jobject) {
 }
 
 /* ---- continuous thread CPU sampler (tamper scanner hunter) ---------------
- * A dedicated thread wakes every RBLX_TS_INTERVAL_MS, snapshots ALL
- * /proc/self/task/*/stat cpu ticks, and appends one line to the log
+ * Dedicated thread wakes every RBLX_TS_INTERVAL_MS, snapshots ALL
+ * /proc/self/task entries stat cpu ticks, and appends one line to the log
  * describing new threads, the biggest cpu burner, and any spikes
- * (delta >= ~80% of the window). It also logs the pcall call count as
- * activity proxy (Roblox drives Lua through our detour). This produces
- * a time series right up to the freeze — showing WHICH thread is the
- * periodic .text-validator that freezes us.
+ * (delta >= 80% of the window). It also logs the pcall call count as
+ * an activity proxy (Roblox drives Lua through our detour), giving a
+ * time series right up to the freeze, showing WHICH thread is the
+ * periodic text-validator that freezes us.
  */
 struct ts_thread_t { long tid; char comm[32]; long cpu; };
 
