@@ -324,6 +324,78 @@ static int install_hooks(void) {
 #endif
 }
 
+/* ---- luaB_loadstring runtime gate patch -------------------------------
+ * The engine's luaB_loadstring refuses to compile the chunk in Roblox's
+ * script context: five conditional branches redirect to the error strings
+ *
+ *   0x2f7cc6 "loadstring() is not available in RobloxScript context."
+ *   0x3681ad "loadstring() is not available"
+ *
+ * (the second one is what jni_diag reported as errtxt). Offsets are the
+ * link-time VAs of this exact binary — same family as the FB table below,
+ * so runtime address = module base + VA. Bytes are verified against the
+ * expected dword before writing (version drift can never half-patch):
+ *   0x3a53fd4  tbnz w0,#3  → skip NOP          (long msg gate)
+ *   0x3a54008  cbz  x8     → skip b 0x3a54014  (short msg gate; unconditional
+ *                                              branch dodges the NULL deref
+ *                                              ldrb [x8,#0xc8] at 0x3a5400c)
+ *   0x3a54010  cbz  w8     → skip NOP
+ *   0x3a540b4  tbz  w0,#0  → skip NOP
+ *   0x3a540bc  tbz  w0,#0  → skip NOP
+ */
+#define RBLX_LS_GATE_N 5
+struct {
+	uint32_t off;   /* link-time VA (== runtime offset from base) */
+	uint32_t imm;   /* expected instruction dword                     */
+	uint32_t want;  /* replacement dword                              */
+} static const ls_gates[RBLX_LS_GATE_N] = {
+	{ 0x3a53fd4, 0x371810c0, 0xd503201f },  /* NOP (mov x0, #0 -> long msg)   */
+	{ 0x3a54008, 0xb4000ec8, 0x14000003 },  /* b  0x3a54014                  */
+	{ 0x3a54010, 0x34000e88, 0xd503201f },  /* NOP                            */
+	{ 0x3a540b4, 0x36000960, 0xd503201f },  /* NOP                            */
+	{ 0x3a540bc, 0x36000920, 0xd503201f },  /* NOP                            */
+};
+static bool g_lsg_patched = false;
+static int  g_lsg_rc      = -1;
+
+static int patch_loadstring_gates(const rblx_Module *mod) {
+	if (g_lsg_patched) return g_lsg_rc;
+	if (!mod || !mod->base) { g_lsg_rc = -101; return g_lsg_rc; }
+	long ps = sysconf(_SC_PAGESIZE);
+	int applied = 0, failed = 0;
+	for (int i = 0; i < RBLX_LS_GATE_N; i++) {
+		uint8_t    *a = (uint8_t*)mod->base + ls_gates[i].off;
+		uint32_t cur = rblx_read_u32(a);
+		if (cur != ls_gates[i].imm) {
+			LOGE("ls-gate[%d] @base+0x%llx: got %#08x want=%#08x — version drift, skip",
+			     i, (unsigned long long)ls_gates[i].off, cur,
+			     ls_gates[i].imm);
+			failed++;
+			continue;
+		}
+		uintptr_t pg = (uintptr_t)a & ~(uintptr_t)(ps - 1);
+		if (mprotect((void*)pg, (size_t)ps,
+		             PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+			LOGE("ls-gate[%d] mprotect fail errno=%d", i, errno);
+			failed++;
+			continue;
+		}
+		*(volatile uint32_t*)a = ls_gates[i].want;
+		__builtin___clear_cache((char*)a, (char*)a + 4);
+		mprotect((void*)pg, (size_t)ps, PROT_READ | PROT_EXEC); /* restore */
+		applied++;
+		LOGV("ls-gate[%d] @off+0x%llx: %08x -> %08x",
+		     i, (unsigned long long)ls_gates[i].off,
+		     ls_gates[i].imm, ls_gates[i].want);
+	}
+	LOGI("loadstring gates: applied=%d failed=%d", applied, failed);
+	if (!failed) { g_lsg_patched = true; g_lsg_rc = 0; }
+	else          { g_lsg_rc = -2; }
+	tslog("LSGATE rc=%d applied=%d failed=%d",
+	      g_lsg_rc, applied, failed);
+	return g_lsg_rc;
+}
+
 /* ---- symbol resolution (in-memory ELF dynsym walk; NO dlopen) ---- */
 static int bind_symbols(const rblx_Module *mod) {
 	if (!mod || !mod->base) return -101;
@@ -653,6 +725,13 @@ static int ensure_engine_locked(void) {
 		LOGW("engine: resolve_lua_state rc=%d state_ptr=%p", rs,
 		     (void*)g_sym.lua_state_ptr);
 	}
+	/* Always disarm Roblox's loadstring gates — this is what makes
+	 * `luaB_loadstring` compile a plain chunk on the game thread. */
+	if (!g_lsg_patched) {
+		int gp = patch_loadstring_gates(&mod);
+		LOGI("engine: loadstring gates patch rc=%d", gp);
+		if (gp != 0) LOGW("engine: loadstring gate patch partial/failed rc=%d", gp);
+	}
 	if (!g_hooks_active) {
 		int ih = install_hooks();
 		LOGI("engine: install_hooks rc=%d hooks_active=%d", ih,
@@ -945,6 +1024,7 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "lua_state_ptr:%p\n"
 	         "g_cur:%p\n"
 	         "hooks_active:%d\n"
+	         "load_gates:%d\n"
 	         "unc_injected:%d\n"
 	         "queue:%s\n"
 	         "lua_alive:%s\n"
@@ -957,7 +1037,7 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         (void*)g_sym.lua_pcall, (void*)g_sym.lua_tolstring,
 	         (void*)g_sym.luaL_newstate,
 	         (void*)g_sym.lua_state_ptr, (void*)g_cur,
-	         (int)g_hooks_active, (int)g_unc_injected,
+	         (int)g_hooks_active, (int)g_lsg_rc, (int)g_unc_injected,
 	         g_pending_len ? "busy" : "idle",
 	         L ? "yes" : "no",
 	         g_last_exec_err);
