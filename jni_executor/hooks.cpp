@@ -185,9 +185,14 @@ int rblx_hook_install(rblx_Hook *h, void *target, void *detour, int min_bytes){
 	memset(h,0,sizeof(*h));
 	h->target=target; h->detour=detour; h->active=false;
 	h->name="?";
-	/* ARM64: 16-byte patch (>=4 instrs, aligned & reloc-safe) */
+	/* ARM64: 16-byte patch (>=4 instrs, aligned & reloc-safe).
+	 * The stub layout is fixed: [ldr x16,[pc,#8]; br x16; u64 detour]
+	 * = 16 bytes + an 8-byte pointer at target+8. The trampoline resume
+	 * lands on target+patch, so patch MUST be 16+ — an 8-byte patch makes
+	 * the resume jump INTO the pointer slot (SIGILL on the data bytes).   */
 	int patch=16;
 	if(min_bytes>patch) patch=(min_bytes+3)&~3;
+	if(patch<16) patch=16;                    /* never below the 16B stub   */
 	if((size_t)patch>sizeof(h->patch)) patch=(int)sizeof(h->patch);
 	h->backup_len=patch;
 

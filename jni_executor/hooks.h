@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 #define RBLX_HOOK_TRAMP_MAX 128   /* max trampoline byte budget            */
-#define RBLX_HOOK_PATCH_SIZE 8    /* minimum patchable region on ARM64     */
+#define RBLX_HOOK_PATCH_SIZE 32   /* ARM64 stub needs 16B: ldr+br+u64 ptr; keep slack */
 
 typedef struct {
     void *target;          /* runtime address being hooked                */
