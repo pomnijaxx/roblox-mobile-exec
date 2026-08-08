@@ -521,6 +521,9 @@ static void pump_pending(rblx_lua_State *L) {
 	int rc = RBLX_LUA_ERRRUN;
 	ls_orig_t ls = reinterpret_cast<ls_orig_t>(rblx_trampoline_loadstring());
 	pc_orig_t pc = reinterpret_cast<pc_orig_t>(rblx_trampoline_pcall());
+	/* Armazena a mensagem ANTES de qualquer settop (senão o erro some e
+	 * o Diag mostra msg=? — era exatamente isso que víamos). */
+	char errtxt[160] = "";
 	/* Preferred path: the engine's OWN `loadstring` C function, wrapped in a
 	 * FRESH C closure and driven through lua_pcall. Calling the raw engine
 	 * function directly with the game's stack was WRONG: loadstring reads
@@ -537,6 +540,7 @@ static void pump_pending(rblx_lua_State *L) {
 		                      nullptr, 0, nullptr);
 		g_sym.lua_pushstring(L, src);
 		int n = pc(L, 1, 1, 0);      /* loadstring(src) → chunk | nil */
+		LOGV("loadstring pcall n=%d", n);
 		if (n == RBLX_LUA_OK) {
 			/* engine loadstring contract: 1 result = chunk (function) on
 			 * top, or nil on compile failure. Check the type — calling
@@ -553,20 +557,37 @@ static void pump_pending(rblx_lua_State *L) {
 				rc = pc(L, 0, 0, 0); /* run the chunk (net stack balance) */
 			} else {
 				rc = RBLX_LUA_ERRSYNTAX;
+				if (g_sym.lua_tolstring)
+					snprintf(errtxt, sizeof(errtxt), "%.150s",
+					         g_sym.lua_tolstring(L, -1, NULL) ?: "nil");
 				if (g_sym.lua_settop) g_sym.lua_settop(L, top);
 			}
 		} else {
 			rc = (n == RBLX_LUA_ERRMEM) ? n : RBLX_LUA_ERRSYNTAX;
+			LOGV("loadstring pcall FAIL n=%d rc=%d", n, rc);
+			if (g_sym.lua_tolstring)
+				snprintf(errtxt, sizeof(errtxt), "%.150s",
+				         g_sym.lua_tolstring(L, -1, NULL) ?: "nil");
 			if (g_sym.lua_settop) g_sym.lua_settop(L, top);  /* drop err */
 		}
 	} else if (ls && pc) {
 		int e = ls(L, src, "@executor-injected");
 		if (e == RBLX_LUA_OK) rc = pc(L, 0, 0, 0);
-		else rc = e;
+		else {
+			rc = e;
+			if (g_sym.lua_tolstring)
+				snprintf(errtxt, sizeof(errtxt), "%.150s",
+				         g_sym.lua_tolstring(L, -1, NULL) ?: "nil");
+		}
 	} else if (g_sym.luaL_loadstring && g_sym.lua_pcall) {
 		int e = g_sym.luaL_loadstring(L, src, "@executor-injected");
 		if (e == RBLX_LUA_OK) rc = g_sym.lua_pcall(L, 0, 0, 0);
-		else rc = e;
+		else {
+			rc = e;
+			if (g_sym.lua_tolstring)
+				snprintf(errtxt, sizeof(errtxt), "%.150s",
+				         g_sym.lua_tolstring(L, -1, NULL) ?: "nil");
+		}
 	}
 	if (rc != RBLX_LUA_OK) {
 		const char *msg = g_sym.lua_tolstring
@@ -575,7 +596,8 @@ static void pump_pending(rblx_lua_State *L) {
 		/* guarda p/ o Diag mostrar no console (sem precisar de logcat) */
 		pthread_mutex_lock(&g_lock);
 		snprintf(g_last_exec_err, sizeof(g_last_exec_err),
-		         "err=%d msg=%s src=%.100s", rc, msg ? msg : "?", src);
+		         "err=%d errtxt=%s msg=%s src=%.100s",
+		         rc, errtxt[0] ? errtxt : "?", msg ? msg : "?", src);
 		pthread_mutex_unlock(&g_lock);
 	} else {
 		pthread_mutex_lock(&g_lock);
