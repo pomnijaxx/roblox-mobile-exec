@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <dirent.h>
 
 #include "lua_compat.h"
 #include "scan.h"
@@ -39,7 +40,7 @@
 //       the anti-tamper scanner is watching pcall/loadstring specifically and
 //       we can execute via raw pcall pointer from a non-critical detour.
 #ifndef RBLX_HOOK_MODE
-#define RBLX_HOOK_MODE 2
+#define RBLX_HOOK_MODE 1
 #endif
 #define LOG_TAG "RobloxExec"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -581,6 +582,80 @@ static int jni_alive(JNIEnv*, jobject) {
 	return S ? 0 : -1;
 }
 
+/* ---- thread CPU sampler: find the tamper scanner by behavior -----------
+ * The scanner wakes periodically to verify .text. We sample every thread's
+ * utime+stime over ~2.5s and report which threads burn CPU. The tamper
+ * thread shows a distinctive periodic pattern (quiet, then a burst).
+ */
+#define RBLX_TSCAN_MAX_THREADS 256
+struct tscan_t { long tid; char comm[32]; long cpu0; long cpu1; long dt; };
+
+static int tscan_read(long tid, char *comm, size_t commsz, long *ut, long *stm) {
+	char p[64], line[640];
+	snprintf(p, sizeof(p), "/proc/self/task/%ld/stat", tid);
+	FILE *f = fopen(p, "r");
+	if (!f) return -1;
+	if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+	fclose(f);
+	char cm[32] = "";
+	long u = 0, s = 0;
+	/* 1:pid (2:comm) 3:state 4..13 ints 14:utime 15:stime */
+	if (sscanf(line, "%*d (%31[^)]) %*c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %ld %ld",
+	           cm, &u, &s) < 2) return -1;
+	snprintf(comm, commsz, "%s", cm);
+	*ut = u; *stm = s;
+	return 0;
+}
+
+static void scan_threads(char *out, size_t outsz) {
+	DIR *d = opendir("/proc/self/task");
+	if (!d) { snprintf(out, outsz, "[tscan] opendir failed"); return; }
+	struct tscan_t T[RBLX_TSCAN_MAX_THREADS];
+	int n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) && n < RBLX_TSCAN_MAX_THREADS) {
+		if (e->d_name[0] == '.') continue;
+		long tid = atol(e->d_name);
+		if (tid <= 0) continue;
+		long ut = 0, stm = 0;
+		if (tscan_read(tid, T[n].comm, sizeof(T[n].comm), &ut, &stm) == 0) {
+			T[n].tid = tid;
+			T[n].cpu0 = ut + stm;
+			T[n].cpu1 = 0;
+			T[n].dt = 0;
+			n++;
+		}
+	}
+	closedir(d);
+
+	/* sample 2: wait ~2s, re-read, compute delta */
+	struct timespec ts = {0, 200 * 1000 * 1000};
+	nanosleep(&ts, NULL);
+	for (int i = 0; i < n; i++) {
+		long ut = 0, stm = 0;
+		char cm[32] = "";
+		if (tscan_read(T[i].tid, cm, sizeof(cm), &ut, &stm) == 0) {
+			T[i].cpu1 = ut + stm;
+			T[i].dt = T[i].cpu1 - T[i].cpu0;
+		}
+	}
+
+	/* report: all threads with nonzero CPU delta (sorted by delta desc) */
+	for (int i = 0; i < n - 1; i++)
+		for (int j = i + 1; j < n; j++)
+			if (T[j].dt > T[i].dt) { struct tscan_t t = T[i]; T[i] = T[j]; T[j] = t; }
+
+	size_t used = (size_t)snprintf(out, outsz, "[tscan] %d threads, 2s cpu delta:\n", n);
+	for (int i = 0; i < n; i++) {
+		if (T[i].dt <= 0) continue;
+		int cap = (int)(outsz - used);
+		if (cap <= 0) break;
+		used += (size_t)snprintf(out + used, (size_t)cap,
+		                         "  tid=%ld cpu=%ld %s\n",
+		                         T[i].tid, T[i].dt, T[i].comm);
+	}
+}
+
 static jstring jni_diag(JNIEnv *env, jclass) {
 	char buf[2048];
 	char found[512] = "";
@@ -647,6 +722,13 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         g_pending_len ? "busy" : "idle",
 	         L ? "yes" : "no");
 	pthread_mutex_unlock(&g_lock);
+
+	/* thread CPU scan — find the periodic tamper scanner by behavior */
+	char tscan[2048];
+	scan_threads(tscan, sizeof(tscan));
+	size_t bl = strlen(buf);
+	snprintf(buf + bl, sizeof(buf) - bl, "\n%s", tscan);
+
 	return env->NewStringUTF(buf);
 }
 
