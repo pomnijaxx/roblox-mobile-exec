@@ -141,12 +141,28 @@ public final class ScriptLoader {
     @SuppressWarnings("unused") // called from the injected bridge
     public static void autoExec(android.content.Context ctx) {
         if (ctx == null) return;
+        File f = null;
         try {
-            File dir = new File(ctx.getFilesDir(), "robloxexec");
-            File f = new File(dir, "autoload.lua");
-            if (!f.isFile()) return;
+            // 1) download público (o usuário cola o .lua lá sem root):
+            File dl = new File(android.os.Environment
+                    .getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
+                    "robloxexec/autoload.lua");
+            if (dl.isFile()) f = dl;
+        } catch (Throwable ignored) {
+        }
+        if (f == null) {
+            // 2) fallback: filesDir do app
+            try {
+                File dir = new File(ctx.getFilesDir(), "robloxexec");
+                File alt = new File(dir, "autoload.lua");
+                if (alt.isFile()) f = alt;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (f == null) return;
+        try {
             String src = readAll(new FileInputStream(f));
-            ExecutorUI.appendLog("[autoload] executing " + src.length() + " bytes");
+            ExecutorUI.appendLog("[autoload] " + f.getPath() + " executing " + src.length() + " bytes");
             int rc = Executor.nativeExec(src);
             ExecutorUI.appendLog(rc == 0
                     ? "[autoload] done (0)"
