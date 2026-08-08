@@ -194,7 +194,8 @@ extern "C" void *rblx_trampoline_tolstring(void){ return g_hook_tolstring.active
 #define RBLX_QUEUE_MAX (1u<<16)
 static pthread_mutex_t g_queue_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_queue_cv = PTHREAD_COND_INITIALIZER;
-static char    g_pending[RBLX_QUEUE_MAX];
+static char g_pending[RBLX_QUEUE_MAX];
+static char g_last_exec_err[320] = "";   /* último erro de exec p/ o Diag */
 static size_t  g_pending_len   = 0;
 static int     g_pending_rc    = RBLX_LUA_OK;
 static bool    g_pending_done  = false;
@@ -571,6 +572,15 @@ static void pump_pending(rblx_lua_State *L) {
 		const char *msg = g_sym.lua_tolstring
 		                  ? g_sym.lua_tolstring(L, -1, NULL) : nullptr;
 		LOGW("exec err=%d: %s :: %.180s", rc, msg ? msg : "?", src);
+		/* guarda p/ o Diag mostrar no console (sem precisar de logcat) */
+		pthread_mutex_lock(&g_lock);
+		snprintf(g_last_exec_err, sizeof(g_last_exec_err),
+		         "err=%d msg=%s src=%.100s", rc, msg ? msg : "?", src);
+		pthread_mutex_unlock(&g_lock);
+	} else {
+		pthread_mutex_lock(&g_lock);
+		g_last_exec_err[0] = '\0';
+		pthread_mutex_unlock(&g_lock);
 	}
 
 	pthread_mutex_lock(&g_queue_mu);
@@ -915,7 +925,8 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         "hooks_active:%d\n"
 	         "unc_injected:%d\n"
 	         "queue:%s\n"
-	         "lua_alive:%s",
+	         "lua_alive:%s\n"
+	         "lastexec:%s",
 	         found,
 	         (g_sym.luaL_loadstring || g_sym.luaB_loadstring ||
 	          g_sym.lua_pcall) ? "bound" : "unbound",
@@ -926,7 +937,8 @@ static jstring jni_diag(JNIEnv *env, jclass) {
 	         (void*)g_sym.lua_state_ptr, (void*)g_cur,
 	         (int)g_hooks_active, (int)g_unc_injected,
 	         g_pending_len ? "busy" : "idle",
-	         L ? "yes" : "no");
+	         L ? "yes" : "no",
+	         g_last_exec_err);
 	pthread_mutex_unlock(&g_lock);
 
 	/* thread CPU scan — find the periodic tamper scanner by behavior */
